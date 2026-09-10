@@ -1,0 +1,49 @@
+project:
+  name: "vehicle_speed_yolo"
+  version: "0.1.0"
+  description: "Benchmark de detección vehicular con variantes YOLO para TFG"
+
+detection:
+  # Modelos a evaluar — variantes ligeras priorizadas para hardware embebido
+  models:
+    - id: "yolov8n"
+      weights: "yolov8n.pt"
+      description: "YOLOv8 Nano — más liviano, mayor velocidad"
+    - id: "yolov8s"
+      weights: "yolov8s.pt"
+      description: "YOLOv8 Small — balance entre velocidad y precisión"
+    - id: "yolov8m"
+      weights: "yolov8m.pt"
+      description: "YOLOv8 Medium — mayor precisión, más pesado"
+    - id: "yolo11n"
+      weights: "yolo11n.pt"
+      description: "YOLO11 Nano — versión más reciente, muy liviana"
+    - id: "yolo11s"
+      weights: "yolo11s.pt"
+      description: "YOLO11 Small — versión más reciente, liviana"
+
+  # Clases de vehículos en COCO dataset
+  vehicle_classes:
+    2: "car"
+    3: "motorcycle"
+    5: "bus"
+    7: "truck"
+
+  confidence_threshold: 0.40
+  iou_threshold: 0.45
+
+benchmark:
+  warmup_frames: 15          # Frames de calentamiento (no se miden)
+  max_frames: 300            # Máximo de frames a procesar por video
+  device: "cpu"              # "cpu" simula condiciones de RPi4; "cuda" si hay GPU
+  save_annotated_frames: true
+  annotated_frame_interval: 50  # Guardar un frame anotado cada N frames
+
+paths:
+  data: "data/"
+  videos: "data/videos/"
+  models: "models/"
+  results: "results/"
+  benchmarks: "results/benchmarks/"
+  plots: "results/plots/"
+  frames: "results/frames/"

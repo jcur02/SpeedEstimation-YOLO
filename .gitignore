@@ -1,0 +1,36 @@
+# Entornos virtuales
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Pesos de modelos YOLO (se descargan automáticamente en models/)
+models/*.pt
+*.pt
+
+# Videos de prueba (proporcionados por el usuario)
+data/videos/*.mp4
+data/videos/*.avi
+data/videos/*.mov
+data/videos/*.mkv
+
+# Resultados generados por el benchmark
+results/benchmarks/*.csv
+results/benchmarks/*.json
+results/plots/*.png
+results/frames/**
+results/benchmark.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Documentos de prompts (notas de trabajo, no forman parte del proyecto)
+*[Pp][Rr][Oo][Mm][Pp][Tt]*.md
+
+# Sistema
+.DS_Store
