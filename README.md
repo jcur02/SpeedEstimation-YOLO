@@ -188,6 +188,112 @@ script detecta automáticamente la ausencia de display y cae a modo exportación
 cuenta, pero pasar `--export` explícitamente evita la advertencia y dejará el archivo
 donde se indique con `--output`.
 
+## Región de interés (ROI)
+
+Las cámaras suelen encuadrar más que la vía de interés: carril contrario, vehículos
+parqueados, un parqueo lateral, una calle de fondo. Todo eso contamina el conteo de
+vehículos y, más adelante, contaminaría el seguimiento y produciría velocidades sin
+sentido. La ROI delimita esa zona válida con un polígono trazado una sola vez sobre la
+escena, que se guarda en disco y se reutiliza en todas las corridas de ese sitio.
+
+**Aclaración conceptual importante: la ROI no acelera la inferencia.** YOLO redimensiona
+su entrada a un tamaño fijo (`imgsz`), así que el costo de cómputo no depende del área de
+la escena. El beneficio de la ROI es **reducir ruido y falsos positivos**, no ganar FPS.
+Cualquier ganancia de rendimiento vendría de bajar `imgsz`, saltar frames o usar un modelo
+más liviano — no de recortar la escena.
+
+La única excepción es el modo `crop`, que sí puede **mejorar la precisión** (no la
+velocidad): al recortar y reescalar la zona de interés, los vehículos lejanos ocupan más
+píxeles de la entrada de la red y se detectan mejor. Vale la pena medir ese efecto.
+
+### Los tres modos
+
+| Modo | Qué hace | Cuándo usarlo |
+|---|---|---|
+| `filter` (default) | Corre la inferencia sobre el frame completo y descarta después las detecciones fuera del polígono. | Uso general. No afecta la calidad de detección, solo el conteo. |
+| `crop` | Recorta el frame al rectángulo envolvente de la ROI antes de correr la inferencia. | Cuando los vehículos lejanos dentro de la ROI son pequeños y se pierden — el recorte los agranda relativamente. |
+| `mask` | Ennegrece todo lo exterior al polígono antes de la inferencia. | Solo para comparar empíricamente contra los otros dos; suele **empeorar** las detecciones cerca del borde porque genera una imagen fuera de la distribución de entrenamiento de la red. |
+
+### Supuesto de diseño: cámara fija
+
+La ROI asume que la cámara no se mueve entre la calibración y el uso. Si se reorienta o
+se reposiciona, hay que volver a marcarla. El campo `reference_frame_md5` del JSON (más
+un thumbnail de referencia guardado aparte) sirve para detectar esto: `select_roi.py
+--show` compara el frame actual contra el de referencia y avisa si difieren demasiado.
+
+### Tabla de argumentos de `select_roi.py`
+
+| Argumento | Tipo | Default | Descripción |
+|---|---|---|---|
+| `--video` | str (múltiple) | auto | Uno o varios videos (rutas o comodines). Default: todos los `.mp4` de `data/videos/`. |
+| `--output` | str | `roi.file` del config | Dónde guardar el JSON. |
+| `--no-heatmap` | flag | False | Salta el mapa de calor y marca sobre un frame limpio. |
+| `--frame-sec` | float | None | Segundo del que se toma el frame de fondo. Default: el frame medio del primer video. |
+| `--sample-mode` | str | `uniform` | `uniform`, `middle` o `range`. |
+| `--samples` | int | `roi.heatmap.samples` | Cuántos frames muestrear para el mapa de calor. |
+| `--model` | str | `roi.heatmap.model` | Modelo usado para acumular el mapa de calor. |
+| `--device` | str | del config | `cpu` o `cuda`. |
+| `--with-homography` | flag | False | Pide además 4 puntos sobre el asfalto, para la calibración futura. |
+| `--show` | flag | False | Solo muestra la ROI ya guardada, sin editarla. |
+
+### Controles del marcado interactivo
+
+| Entrada | Acción |
+|---|---|
+| Clic izquierdo | Agrega un vértice |
+| Clic derecho / `z` | Elimina el último vértice |
+| `c` | Borra todos los vértices y reinicia |
+| `t` | Alterna el mapa de calor encendido/apagado |
+| `Enter` | Cierra el polígono y confirma (requiere ≥ 3 vértices, sin autointersección) |
+| `q` / `ESC` | Sale sin guardar, pidiendo confirmación en consola |
+
+### Formato de `roi.json`
+
+Las coordenadas del polígono se guardan **normalizadas en [0, 1]**, no en píxeles, para
+que la misma ROI sirva si más adelante se procesa el video a otra resolución (por ejemplo
+720p en la Raspberry Pi en vez de 1080p en la máquina de desarrollo):
+
+```json
+{
+  "version": 1,
+  "created_at": "2026-09-10T14:32:07",
+  "source_videos": ["data/videos/sitio_a_01.mp4"],
+  "frame_size": [1920, 1080],
+  "reference_frame_md5": "a3f1...",
+  "roi_polygon": [[0.133, 0.352], [0.164, 0.352], [0.208, 0.930], [0.078, 0.930]],
+  "homography_points": {
+    "image_points": [],
+    "world_points": null,
+    "notes": "Pendiente: completar world_points en la fase de calibración."
+  }
+}
+```
+
+### Ejemplos de uso
+
+```bash
+# Marcar la ROI con mapa de calor sobre todos los videos del sitio
+python scripts/select_roi.py --video "data/videos/sitio_a_*.mp4"
+
+# Videos cortos: subir el muestreo y acumular varios
+python scripts/select_roi.py --video data/videos/*.mp4 --samples 600
+
+# Marcar también los 4 puntos para la homografía futura
+python scripts/select_roi.py --with-homography
+
+# Revisar la ROI guardada y verificar que la cámara no se movió
+python scripts/select_roi.py --show
+
+# Usarla
+python scripts/preview_detection.py --roi
+python scripts/run_benchmark.py --roi
+```
+
+Igual que `select_roi.py`, es una herramienta inherentemente interactiva: si `DISPLAY`
+no está disponible (sesión SSH sin X, como en la Raspberry Pi), el script lo detecta e
+imprime un error explicando que la ROI debe marcarse en una máquina con interfaz gráfica.
+El `roi.json` resultante puede copiarse luego a la Raspberry Pi sin volver a marcarlo.
+
 ## Notas para hardware embebido
 
 - El benchmark corre por defecto con `--device cpu` para aproximar las condiciones

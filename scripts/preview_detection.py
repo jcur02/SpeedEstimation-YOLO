@@ -118,6 +118,14 @@ def parse_args() -> argparse.Namespace:
         "--no-hud", action="store_true",
         help="Arranca con el panel de información (HUD) oculto.",
     )
+    parser.add_argument(
+        "--roi", action="store_true",
+        help="Activa el filtrado por región de interés (requiere haberla marcado con select_roi.py).",
+    )
+    parser.add_argument(
+        "--roi-file", type=str, default=None,
+        help="Ruta del archivo de ROI a usar. Default: roi.file del config.",
+    )
     return parser.parse_args()
 
 
@@ -173,6 +181,11 @@ def apply_overrides(config: dict, args: argparse.Namespace) -> dict:
 
     if args.fps is not None:
         config["preview"]["playback_fps"] = args.fps
+
+    if args.roi:
+        config.setdefault("roi", {})["enabled"] = True
+    if args.roi_file is not None:
+        config.setdefault("roi", {})["file"] = args.roi_file
 
     return config
 

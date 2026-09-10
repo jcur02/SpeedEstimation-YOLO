@@ -18,6 +18,7 @@ import seaborn as sns
 import yaml
 
 from src.utils.metrics import SystemMetrics
+from src.utils.roi import ROIFilter, load_roi
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ class YOLOBenchmark:
     cantidad de vehículos detectados por cada modelo configurado.
     """
 
-    def __init__(self, config, video_path):
+    def __init__(self, config, video_path, roi_filter=None):
         """
         Prepara el benchmark: valida el video, arma la lista de modelos a
         evaluar y crea los directorios de resultados necesarios.
@@ -43,6 +44,12 @@ class YOLOBenchmark:
             config (dict): configuración completa cargada desde config.yaml
                 (ya con los overrides de línea de comandos aplicados).
             video_path (str): ruta al archivo de video de prueba.
+            roi_filter (ROIFilter | None): filtro de región de interés ya
+                construido. Si es None pero `config.roi.enabled` es True, se
+                construye uno automáticamente a partir de `config.roi.file`
+                para la resolución de este video. La ROI está desactivada
+                por defecto: solo se aplica si se pasa explícitamente o si
+                el config la habilita.
 
         Retorna:
             None
@@ -55,6 +62,8 @@ class YOLOBenchmark:
 
         cap = cv2.VideoCapture(video_path)
         opened = cap.isOpened()
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cap.release()
         if not opened:
             raise RuntimeError(f"No se pudo abrir el video con OpenCV: {video_path}")
@@ -73,6 +82,16 @@ class YOLOBenchmark:
         self.benchmark_cfg = config.get("benchmark", {})
         self.metrics = SystemMetrics()
 
+        roi_cfg = config.get("roi", {})
+        if roi_filter is not None:
+            self.roi_filter = roi_filter
+        elif roi_cfg.get("enabled"):
+            roi_data = load_roi(roi_cfg.get("file", "config/roi.json"))
+            self.roi_filter = ROIFilter(roi_data, (width, height), config)
+            logger.info("ROI activa para este benchmark (%.1f%% del frame)", self.roi_filter.area_ratio() * 100)
+        else:
+            self.roi_filter = None
+
     def _process_video(self, detector):
         """
         Procesa el video de prueba con un detector ya cargado, midiendo el
@@ -85,7 +104,10 @@ class YOLOBenchmark:
             list[dict]: una entrada por frame procesado, con las claves
             frame_idx, inference_ms, fps, vehicle_count, car_count,
             truck_count, bus_count, motorcycle_count, avg_confidence,
-            cpu_percent y ram_mb.
+            cpu_percent y ram_mb, más las columnas adicionales
+            vehicle_count_roi, car_count_roi, truck_count_roi,
+            bus_count_roi y motorcycle_count_roi (iguales a sus contrapartes
+            sin sufijo si no hay ROI activa).
         """
         warmup_frames = self.benchmark_cfg.get("warmup_frames", 15)
         max_frames = self.benchmark_cfg.get("max_frames", 300)
@@ -130,7 +152,7 @@ class YOLOBenchmark:
                 counts[det["class_name"]] += 1
                 confidences.append(det["confidence"])
 
-            frame_data.append({
+            row = {
                 "frame_idx": frame_idx,
                 "inference_ms": inference_ms,
                 "fps": fps,
@@ -142,7 +164,27 @@ class YOLOBenchmark:
                 "avg_confidence": float(np.mean(confidences)) if confidences else 0.0,
                 "cpu_percent": sys_metrics["cpu_percent"],
                 "ram_mb": sys_metrics["ram_mb"],
-            })
+            }
+
+            # Columnas adicionales de ROI, estrictamente al final: si no hay
+            # ROI activa, `inside` es la lista completa de detecciones y
+            # estas columnas quedan idénticas a sus contrapartes sin sufijo.
+            if self.roi_filter is not None:
+                inside, _outside = self.roi_filter.filter(detections)
+            else:
+                inside = detections
+
+            roi_counts = {name: 0 for name in _VEHICLE_CLASS_NAMES}
+            for det in inside:
+                roi_counts[det["class_name"]] += 1
+
+            row["vehicle_count_roi"] = len(inside)
+            row["car_count_roi"] = roi_counts["car"]
+            row["truck_count_roi"] = roi_counts["truck"]
+            row["bus_count_roi"] = roi_counts["bus"]
+            row["motorcycle_count_roi"] = roi_counts["motorcycle"]
+
+            frame_data.append(row)
 
             if save_annotated and frame_idx % annotated_interval == 0:
                 annotated = detector.draw_detections(frame, detections)
@@ -165,11 +207,14 @@ class YOLOBenchmark:
             dict: resumen de métricas del modelo (fps_mean, fps_std, fps_p5,
             fps_p95, inference_ms_mean/std, vehicles_per_frame_mean/std,
             avg_confidence_mean, cpu_percent_mean, ram_mb_mean, ram_mb_peak,
-            entre otros).
+            entre otros), más los campos de ROI al final: roi_enabled,
+            roi_area_ratio (None si no hay ROI), vehicles_per_frame_roi_mean
+            y false_positive_ratio (fracción de detecciones fuera del
+            polígono; None si no hay ROI activa).
         """
         df = pd.DataFrame(frame_data)
 
-        return {
+        summary = {
             "model_id": model_info["model_id"],
             "weights": model_info["weights"],
             "parameters_M": model_info["parameters_M"],
@@ -188,6 +233,19 @@ class YOLOBenchmark:
             "ram_mb_mean": float(df["ram_mb"].mean()),
             "ram_mb_peak": float(df["ram_mb"].max()),
         }
+
+        roi_enabled = self.roi_filter is not None
+        total_all = df["vehicle_count"].sum()
+        total_inside = df["vehicle_count_roi"].sum()
+
+        summary["roi_enabled"] = roi_enabled
+        summary["roi_area_ratio"] = self.roi_filter.area_ratio() if roi_enabled else None
+        summary["vehicles_per_frame_roi_mean"] = float(df["vehicle_count_roi"].mean())
+        summary["false_positive_ratio"] = (
+            float((total_all - total_inside) / total_all) if roi_enabled and total_all > 0 else None
+        )
+
+        return summary
 
     def run(self):
         """
@@ -318,6 +376,8 @@ class YOLOBenchmark:
             "model_id", "frame_idx", "inference_ms", "fps", "vehicle_count",
             "car_count", "truck_count", "bus_count", "motorcycle_count",
             "avg_confidence", "cpu_percent", "ram_mb",
+            "vehicle_count_roi", "car_count_roi", "truck_count_roi",
+            "bus_count_roi", "motorcycle_count_roi",
         ]
         pd.DataFrame(all_frame_data, columns=columns).to_csv(csv_path, index=False)
 
@@ -328,6 +388,12 @@ class YOLOBenchmark:
             "system_info": self.metrics.get_system_info(),
             "config": self.config,
             "models": all_summaries,
+            "roi": {
+                "enabled": self.roi_filter is not None,
+                "mode": self.roi_filter.mode if self.roi_filter else None,
+                "polygon_norm": self.roi_filter.polygon_norm if self.roi_filter else None,
+                "area_ratio": self.roi_filter.area_ratio() if self.roi_filter else None,
+            },
         }
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary_payload, f, indent=2, ensure_ascii=False)

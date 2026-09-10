@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.detection.benchmark import YOLOBenchmark
 from src.utils.logging_setup import setup_logging
+from src.utils.roi import load_roi, polygon_area_ratio
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,14 @@ def parse_args():
     parser.add_argument(
         "--device", type=str, default=None, choices=["cpu", "cuda"],
         help="Sobreescribe el dispositivo de inferencia (cpu o cuda).",
+    )
+    parser.add_argument(
+        "--roi", action="store_true",
+        help="Activa el filtrado por región de interés (requiere haberla marcado con select_roi.py).",
+    )
+    parser.add_argument(
+        "--roi-file", type=str, default=None,
+        help="Ruta del archivo de ROI a usar. Default: roi.file del config.",
     )
     return parser.parse_args()
 
@@ -118,6 +127,11 @@ def apply_overrides(config, args):
 
         config["detection"]["models"] = filtered
 
+    if args.roi:
+        config.setdefault("roi", {})["enabled"] = True
+    if args.roi_file is not None:
+        config.setdefault("roi", {})["file"] = args.roi_file
+
     return config
 
 
@@ -142,6 +156,17 @@ def print_banner(config, video_path):
     print("  Benchmark YOLO — Estimación de velocidad vehicular")
     print(f"  Video: {video_path}")
     print(f"  Dispositivo: {device} | Frames: {max_frames} | Modelos: {n_models}")
+
+    roi_cfg = config.get("roi", {})
+    if roi_cfg.get("enabled"):
+        roi_file = roi_cfg.get("file", "config/roi.json")
+        try:
+            roi_data = load_roi(roi_file)
+            area_pct = polygon_area_ratio(roi_data["roi_polygon"]) * 100
+            print(f"  ROI: activa ({area_pct:.1f}% del frame) — {roi_file}")
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"  ROI: activa pero no se pudo cargar ({exc})")
+
     print(line)
 
     print("\nModelos a evaluar:")

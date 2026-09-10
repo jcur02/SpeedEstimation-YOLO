@@ -30,6 +30,12 @@ results/benchmark.log
 results/preview/**
 results/preview.log
 
+# Región de interés: calibración específica del sitio/video local, y su log
+config/roi.json
+config/roi_reference.png
+config/roi.backup_*.json
+results/roi.log
+
 # Jupyter
 .ipynb_checkpoints/
 

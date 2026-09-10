@@ -60,3 +60,23 @@ preview:
   export_codec: "mp4v"           # Codec para el video exportado
   export_dir: "results/preview/"
   snapshots_dir: "results/preview/snapshots/"
+
+roi:
+  enabled: false                # Por defecto apagado: las corridas previas siguen siendo comparables
+  file: "config/roi.json"       # Dónde se guarda el polígono
+  mode: "filter"                # "filter" | "crop" | "mask"
+  ground_point: "bottom_center" # Punto del bbox usado para la prueba dentro/fuera
+  tolerance_px: 0                # Margen: >0 acepta detecciones ligeramente fuera del borde
+  draw_overlay: true             # Dibujar el polígono en la vista previa
+  overlay_alpha: 0.20
+
+  heatmap:
+    sample_mode: "uniform"      # "uniform" | "middle" | "range"
+    samples: 300                 # Cuántos frames se muestrean para el mapa de calor
+    range_start_sec: 0.0          # Solo para sample_mode "range"
+    range_end_sec: 0.0            # 0 = hasta el final
+    model: "yolov8n"              # Modelo usado para acumular (el más rápido basta)
+    confidence: 0.25               # Umbral BAJO a propósito: acá se busca cobertura, no precisión
+    blur_kernel: 41                 # Suavizado gaussiano del mapa acumulado (impar)
+    colormap: "COLORMAP_JET"
+    alpha: 0.45                      # Mezcla del mapa sobre el frame de fondo

@@ -26,6 +26,7 @@ import numpy as np
 from tqdm import tqdm
 
 from src.detection.detector import VehicleDetector
+from src.utils.roi import ROIFilter, load_roi
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,10 @@ class DetectionVisualizer:
     `results/frames/`: toda su salida va a `results/preview/`.
     """
 
-    def __init__(self, config: Dict[str, Any], detector: VehicleDetector, video_path: str) -> None:
+    def __init__(
+        self, config: Dict[str, Any], detector: VehicleDetector, video_path: str,
+        roi_filter: Optional[ROIFilter] = None,
+    ) -> None:
         """
         Abre el video y prepara el estado interno del visualizador.
 
@@ -67,12 +71,18 @@ class DetectionVisualizer:
             detector (VehicleDetector): instancia ya construida del detector
                 a usar como modelo principal.
             video_path (str): ruta al archivo de video a visualizar.
+            roi_filter (ROIFilter | None): filtro de región de interés ya
+                construido para la resolución de este video. Si es None pero
+                `config.roi.enabled` es True, se construye uno automáticamente
+                a partir de `config.roi.file` una vez que se conoce la
+                resolución real del video (ver más abajo).
 
         Retorna:
             None
 
         Excepciones:
-            FileNotFoundError: si `video_path` no existe en disco.
+            FileNotFoundError: si `video_path` no existe en disco, o si la
+                ROI está habilitada pero su archivo no existe.
             RuntimeError: si OpenCV no puede abrir el video (formato o
                 codec no soportado).
         """
@@ -114,6 +124,19 @@ class DetectionVisualizer:
         self.export_codec = preview_cfg.get("export_codec", "mp4v")
         self.export_dir = preview_cfg.get("export_dir", "results/preview/")
         self.snapshots_dir = preview_cfg.get("snapshots_dir", "results/preview/snapshots/")
+
+        roi_cfg = config.get("roi", {})
+        self.roi_draw_overlay = bool(roi_cfg.get("draw_overlay", True))
+        if roi_filter is not None:
+            self.roi_filter: Optional[ROIFilter] = roi_filter
+        elif roi_cfg.get("enabled"):
+            roi_data = load_roi(roi_cfg.get("file", "config/roi.json"))
+            self.roi_filter = ROIFilter(roi_data, (self.width, self.height), config)
+            logger.info(
+                "ROI activa para la vista previa (%.1f%% del frame)", self.roi_filter.area_ratio() * 100
+            )
+        else:
+            self.roi_filter = None
 
         # Controlados por el script CLI antes de correr; no forman parte del
         # prompt original pero son necesarios para soportar --start-sec y
@@ -372,7 +395,9 @@ class DetectionVisualizer:
             info (dict): datos a mostrar. Debe contener las claves
                 `frame_idx`, `total_frames`, `model_id`, `inference_ms`,
                 `display_fps`, `counts`, `total_vehicles`, `paused` y
-                `conf_threshold`.
+                `conf_threshold`. Si incluye `roi_active=True`, además debe
+                traer `roi_inside`/`roi_outside` y se agrega una línea extra
+                con el desglose dentro/fuera de la ROI.
 
         Retorna:
             numpy.ndarray: copia del frame con el HUD dibujado encima.
@@ -394,6 +419,9 @@ class DetectionVisualizer:
             f'Inferencia: {info["inference_ms"]:.1f} ms | Display: {info["display_fps"]:.1f} FPS',
             f'Vehiculos: {info["total_vehicles"]}{detail}',
         ]
+
+        if info.get("roi_active"):
+            lines.append(f'ROI: {info["roi_inside"]} dentro · {info["roi_outside"]} fuera')
 
         panel_w = min(w - 20, 460)
         panel_h = pad * 2 + line_height * len(lines)
@@ -429,53 +457,190 @@ class DetectionVisualizer:
 
         return annotated
 
-    def _label_compare_half(self, frame: np.ndarray, model_id: str, inference_ms: float, vehicle_count: int) -> np.ndarray:
+    def _label_compare_half(
+        self, frame: np.ndarray, model_id: str, inference_ms: float, vehicle_count: int,
+        outside_count: Optional[int] = None,
+    ) -> np.ndarray:
         """
         Dibuja un rótulo compacto sobre una de las dos mitades de la vista
         de comparación, con el nombre del modelo, su tiempo de inferencia y
         el conteo de vehículos detectados en ese frame.
 
+        Parámetros:
+            outside_count (int | None): si la ROI está activa, cantidad de
+                detecciones fuera de ella, para mostrar "N dentro / M fuera".
+
         Retorna:
             numpy.ndarray: copia del frame con el rótulo dibujado.
         """
         annotated = frame.copy()
-        text = f'{model_id} | {inference_ms:.1f} ms | Veh: {vehicle_count}'
+        if outside_count is None:
+            text = f'{model_id} | {inference_ms:.1f} ms | Veh: {vehicle_count}'
+        else:
+            text = f'{model_id} | {inference_ms:.1f} ms | Veh: {vehicle_count} din / {outside_count} fue'
         (text_w, text_h), baseline = cv2.getTextSize(text, _FONT, 0.6, 2)
         cv2.rectangle(annotated, (0, 0), (text_w + 20, text_h + baseline + 16), (0, 0, 0), -1)
         cv2.putText(annotated, text, (10, text_h + 8), _FONT, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
         return annotated
 
-    def _annotate_side(self, frame: np.ndarray, detector: VehicleDetector, show_boxes: bool) -> Tuple[np.ndarray, List[Dict[str, Any]], float]:
+    def _draw_outside_boxes(self, frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndarray:
         """
-        Corre inferencia con un detector dado sobre un frame y opcionalmente
-        dibuja sus cajas. Usado por `run_compare` para procesar cada mitad.
+        Dibuja, sobre una copia del frame, las detecciones que quedaron
+        fuera de la ROI: en gris tenue, grosor 1 y sin etiqueta. Ver qué se
+        está descartando es justamente el valor de esta vista, así que no se
+        ocultan del todo.
+
+        Parámetros:
+            frame (numpy.ndarray): frame ya anotado con las detecciones "dentro".
+            detections (list[dict]): detecciones fuera de la ROI.
+
+        Retorna:
+            numpy.ndarray: copia del frame con las cajas grises agregadas.
+        """
+        annotated = frame.copy()
+        for det in detections:
+            x1, y1, x2, y2 = (int(round(v)) for v in det["bbox"])
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (120, 120, 120), 1)
+        return annotated
+
+    def _detect_with_roi(
+        self, frame: np.ndarray, detector: VehicleDetector, roi_active: bool
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float]:
+        """
+        Corre la detección aplicando el modo de ROI configurado
+        (`filter`/`crop`/`mask`) y separa el resultado en dentro/fuera.
+
+        En modo `crop`, la inferencia corre solo sobre el recorte y los
+        bboxes se restauran al sistema de coordenadas del frame completo con
+        `restore_bboxes()`. En modo `mask`, la inferencia corre sobre el
+        frame con el exterior de la ROI ennegrecido. En modo `filter` (o sin
+        ROI), la inferencia corre sobre el frame completo sin modificar.
+
+        En todos los casos, el resultado final se filtra con
+        `roi_filter.filter()` para obtener la partición dentro/fuera exacta
+        según el polígono (no solo el rectángulo envolvente de `crop`).
+
+        Parámetros:
+            frame (numpy.ndarray): frame original (resolución completa).
+            detector (VehicleDetector): detector a usar.
+            roi_active (bool): si la ROI está activa en este momento (permite
+                apagarla en caliente con la tecla `o` sin reconstruir el
+                visualizador).
+
+        Retorna:
+            tuple: (detecciones dentro, detecciones fuera, tiempo de
+            inferencia en ms). Si no hay ROI o está desactivada, todas las
+            detecciones van en "dentro" y "fuera" queda vacía.
+        """
+        roi = self.roi_filter if roi_active else None
+
+        t0 = time.perf_counter()
+        if roi is None:
+            detections = detector.detect(frame)
+        elif roi.mode == "crop":
+            cropped, offset = roi.crop(frame)
+            raw = detector.detect(cropped)
+            detections = roi.restore_bboxes(raw, offset)
+        elif roi.mode == "mask":
+            detections = detector.detect(roi.mask(frame))
+        else:
+            detections = detector.detect(frame)
+        t1 = time.perf_counter()
+        inference_ms = (t1 - t0) * 1000.0
+
+        if roi is None:
+            return detections, [], inference_ms
+
+        inside, outside = roi.filter(detections)
+        return inside, outside, inference_ms
+
+    def _annotate_side(
+        self, frame: np.ndarray, detector: VehicleDetector, show_boxes: bool, roi_active: bool = True
+    ) -> Tuple[np.ndarray, List[Dict[str, Any]], List[Dict[str, Any]], float]:
+        """
+        Corre inferencia (con ROI aplicada si corresponde) con un detector
+        dado sobre un frame y opcionalmente dibuja sus cajas. Usado por
+        `run_compare` para procesar cada mitad.
 
         Parámetros:
             frame (numpy.ndarray): frame original (resolución completa).
             detector (VehicleDetector): detector a usar.
             show_boxes (bool): si se deben dibujar las cajas.
+            roi_active (bool): si aplicar la ROI (cuando hay una configurada).
 
         Retorna:
-            tuple: (frame anotado, detecciones, tiempo de inferencia en ms).
+            tuple: (frame anotado, detecciones dentro, detecciones fuera,
+            tiempo de inferencia en ms).
         """
-        t0 = time.perf_counter()
-        detections = detector.detect(frame)
-        t1 = time.perf_counter()
-        inference_ms = (t1 - t0) * 1000.0
+        inside, outside, inference_ms = self._detect_with_roi(frame, detector, roi_active)
 
-        annotated = self._draw_boxes(frame, detections) if show_boxes else frame.copy()
-        return annotated, detections, inference_ms
+        annotated = frame.copy()
+        if show_boxes:
+            annotated = self._draw_boxes(annotated, inside)
+            if outside:
+                annotated = self._draw_outside_boxes(annotated, outside)
+        if roi_active and self.roi_filter is not None and self.roi_draw_overlay:
+            annotated = self.roi_filter.draw(annotated)
+
+        return annotated, inside, outside, inference_ms
 
     # ------------------------------------------------------------------
     # Modos de ejecución
     # ------------------------------------------------------------------
 
+    def _process_live_frame(
+        self, frame: np.ndarray, frame_idx: int, show_boxes: bool, show_hud: bool,
+        roi_active: bool, paused: bool,
+    ) -> Tuple[np.ndarray, float]:
+        """
+        Procesa un único frame para `run_live`: corre la detección (con ROI
+        si corresponde), dibuja cajas/ROI/HUD según el estado actual de los
+        toggles de teclado. Compartido entre el avance normal y el avance
+        manual de un frame en pausa (tecla `n`), para no duplicar lógica.
+
+        Parámetros:
+            roi_active (bool): estado actual del toggle de ROI (tecla `o`).
+            paused (bool): si el video está en pausa (se refleja en el HUD).
+
+        Retorna:
+            tuple: (frame anotado a resolución completa, tiempo de inferencia en ms).
+        """
+        inside, outside, inference_ms = self._detect_with_roi(frame, self.detector, roi_active)
+        display_fps = self._tick_fps()
+
+        annotated = self._draw_boxes(frame, inside) if show_boxes else frame.copy()
+        if show_boxes and outside:
+            annotated = self._draw_outside_boxes(annotated, outside)
+        if roi_active and self.roi_filter is not None and self.roi_draw_overlay:
+            annotated = self.roi_filter.draw(annotated)
+
+        if show_hud:
+            counts = self._count_by_class(inside)
+            info: Dict[str, Any] = {
+                "frame_idx": frame_idx,
+                "total_frames": self.total_frames,
+                "model_id": self.detector.model_id,
+                "inference_ms": inference_ms,
+                "display_fps": display_fps,
+                "counts": counts,
+                "total_vehicles": len(inside),
+                "paused": paused,
+                "conf_threshold": self.detector.confidence_threshold,
+            }
+            if roi_active and self.roi_filter is not None:
+                info["roi_active"] = True
+                info["roi_inside"] = len(inside)
+                info["roi_outside"] = len(outside)
+            annotated = self._draw_hud(annotated, info)
+
+        return annotated, inference_ms
+
     def run_live(self) -> None:
         """
         Reproduce el video en una ventana interactiva con las detecciones
         dibujadas en tiempo real, respondiendo a los controles de teclado
-        (pausa, salir, captura, avanzar frame, mostrar/ocultar cajas y HUD,
-        ajustar velocidad y reiniciar).
+        (pausa, salir, captura, avanzar frame, mostrar/ocultar cajas, HUD y
+        ROI, ajustar velocidad y reiniciar).
 
         Retorna:
             None
@@ -486,6 +651,7 @@ class DetectionVisualizer:
         paused = False
         show_boxes = True
         show_hud = self.show_hud
+        roi_active = self.roi_filter is not None
 
         last_full_annotated: Optional[np.ndarray] = None
         last_display: Optional[np.ndarray] = None
@@ -506,29 +672,10 @@ class DetectionVisualizer:
                     frame_idx += 1
                     frames_processed += 1
 
-                    t0 = time.perf_counter()
-                    detections = self.detector.detect(frame)
-                    t1 = time.perf_counter()
-                    inference_ms = (t1 - t0) * 1000.0
+                    annotated, inference_ms = self._process_live_frame(
+                        frame, frame_idx, show_boxes, show_hud, roi_active, paused=False,
+                    )
                     inference_times.append(inference_ms)
-
-                    display_fps = self._tick_fps()
-
-                    annotated = self._draw_boxes(frame, detections) if show_boxes else frame.copy()
-                    if show_hud:
-                        counts = self._count_by_class(detections)
-                        info = {
-                            "frame_idx": frame_idx,
-                            "total_frames": self.total_frames,
-                            "model_id": self.detector.model_id,
-                            "inference_ms": inference_ms,
-                            "display_fps": display_fps,
-                            "counts": counts,
-                            "total_vehicles": len(detections),
-                            "paused": False,
-                            "conf_threshold": self.detector.confidence_threshold,
-                        }
-                        annotated = self._draw_hud(annotated, info)
 
                     last_full_annotated = annotated
                     last_display = self._resize_for_display(annotated)
@@ -559,28 +706,10 @@ class DetectionVisualizer:
                         frame_idx += 1
                         frames_processed += 1
 
-                        t0 = time.perf_counter()
-                        detections = self.detector.detect(frame)
-                        t1 = time.perf_counter()
-                        inference_ms = (t1 - t0) * 1000.0
+                        annotated, inference_ms = self._process_live_frame(
+                            frame, frame_idx, show_boxes, show_hud, roi_active, paused=True,
+                        )
                         inference_times.append(inference_ms)
-                        display_fps = self._tick_fps()
-
-                        annotated = self._draw_boxes(frame, detections) if show_boxes else frame.copy()
-                        if show_hud:
-                            counts = self._count_by_class(detections)
-                            info = {
-                                "frame_idx": frame_idx,
-                                "total_frames": self.total_frames,
-                                "model_id": self.detector.model_id,
-                                "inference_ms": inference_ms,
-                                "display_fps": display_fps,
-                                "counts": counts,
-                                "total_vehicles": len(detections),
-                                "paused": True,
-                                "conf_threshold": self.detector.confidence_threshold,
-                            }
-                            annotated = self._draw_hud(annotated, info)
 
                         last_full_annotated = annotated
                         last_display = self._resize_for_display(annotated)
@@ -588,6 +717,8 @@ class DetectionVisualizer:
                     show_hud = not show_hud
                 elif key_low == ord('b'):
                     show_boxes = not show_boxes
+                elif key_low == ord('o') and self.roi_filter is not None:
+                    roi_active = not roi_active
                 elif key_low == ord('+'):
                     self.playback_fps += 5
                 elif key_low == ord('-'):
@@ -647,6 +778,7 @@ class DetectionVisualizer:
         frame_idx = self.start_frame - 1
         frames_written = 0
         inference_times: List[float] = []
+        roi_active = self.roi_filter is not None
 
         logger.info("Exportando vista previa a %s", output_path)
         try:
@@ -660,26 +792,32 @@ class DetectionVisualizer:
                     break
                 frame_idx += 1
 
-                t0 = time.perf_counter()
-                detections = self.detector.detect(frame)
-                t1 = time.perf_counter()
-                inference_ms = (t1 - t0) * 1000.0
+                inside, outside, inference_ms = self._detect_with_roi(frame, self.detector, roi_active)
                 inference_times.append(inference_ms)
                 display_fps = self._tick_fps()
 
-                counts = self._count_by_class(detections)
-                annotated = self._draw_boxes(frame, detections)
-                info = {
+                counts = self._count_by_class(inside)
+                annotated = self._draw_boxes(frame, inside)
+                if outside:
+                    annotated = self._draw_outside_boxes(annotated, outside)
+                if roi_active and self.roi_filter is not None and self.roi_draw_overlay:
+                    annotated = self.roi_filter.draw(annotated)
+
+                info: Dict[str, Any] = {
                     "frame_idx": frame_idx,
                     "total_frames": self.total_frames,
                     "model_id": self.detector.model_id,
                     "inference_ms": inference_ms,
                     "display_fps": display_fps,
                     "counts": counts,
-                    "total_vehicles": len(detections),
+                    "total_vehicles": len(inside),
                     "paused": False,
                     "conf_threshold": self.detector.confidence_threshold,
                 }
+                if roi_active and self.roi_filter is not None:
+                    info["roi_active"] = True
+                    info["roi_inside"] = len(inside)
+                    info["roi_outside"] = len(outside)
                 annotated = self._draw_hud(annotated, info)
                 annotated = self._resize_for_display(annotated)
 
@@ -765,21 +903,33 @@ class DetectionVisualizer:
         return int(round(combined_w * scale)), int(round(combined_h * scale))
 
     def _build_compare_frame(
-        self, frame: np.ndarray, detector_b: VehicleDetector, show_boxes: bool, show_labels: bool
+        self, frame: np.ndarray, detector_b: VehicleDetector, show_boxes: bool, show_labels: bool,
+        roi_active: bool = True,
     ) -> Tuple[np.ndarray, float, float, int, int]:
         """
         Construye el frame combinado lado a lado para un instante del video.
+
+        Parámetros:
+            roi_active (bool): si aplicar la ROI (cuando hay una configurada)
+                a ambos modelos.
 
         Retorna:
             tuple: (frame combinado ya reescalado, ms modelo A, ms modelo B,
             vehículos modelo A, vehículos modelo B).
         """
-        annotated_a, dets_a, ms_a = self._annotate_side(frame, self.detector, show_boxes)
-        annotated_b, dets_b, ms_b = self._annotate_side(frame, detector_b, show_boxes)
+        annotated_a, inside_a, outside_a, ms_a = self._annotate_side(frame, self.detector, show_boxes, roi_active)
+        annotated_b, inside_b, outside_b, ms_b = self._annotate_side(frame, detector_b, show_boxes, roi_active)
 
         if show_labels:
-            annotated_a = self._label_compare_half(annotated_a, self.detector.model_id, ms_a, len(dets_a))
-            annotated_b = self._label_compare_half(annotated_b, detector_b.model_id, ms_b, len(dets_b))
+            roi_active_effective = roi_active and self.roi_filter is not None
+            annotated_a = self._label_compare_half(
+                annotated_a, self.detector.model_id, ms_a, len(inside_a),
+                len(outside_a) if roi_active_effective else None,
+            )
+            annotated_b = self._label_compare_half(
+                annotated_b, detector_b.model_id, ms_b, len(inside_b),
+                len(outside_b) if roi_active_effective else None,
+            )
 
         combined = np.hstack([annotated_a, annotated_b])
         cv2.line(combined, (self.width, 0), (self.width, self.height), (255, 255, 255), 2)
@@ -788,7 +938,7 @@ class DetectionVisualizer:
         if combined.shape[1] != target_w or combined.shape[0] != target_h:
             combined = cv2.resize(combined, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
-        return combined, ms_a, ms_b, len(dets_a), len(dets_b)
+        return combined, ms_a, ms_b, len(inside_a), len(inside_b)
 
     def _run_compare_live(self, detector_b: VehicleDetector) -> None:
         """
