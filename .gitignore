@@ -26,6 +26,10 @@ results/plots/*.png
 results/frames/**
 results/benchmark.log
 
+# Resultados generados por el modo de vista previa (no es parte del benchmark)
+results/preview/**
+results/preview.log
+
 # Jupyter
 .ipynb_checkpoints/
 

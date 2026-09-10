@@ -114,6 +114,80 @@ la tabla lista para el informe académico.
 Los pesos (`.pt`) se descargan automáticamente en `models/` la primera vez que se
 usa cada modelo.
 
+## Vista previa de detección en video
+
+Herramienta de **validación cualitativa**, independiente del benchmark: permite ver el
+video corriendo con las bounding boxes dibujadas en tiempo real (o exportarlo anotado a
+un archivo), para revisar a simple vista que un modelo detecta bien — que no pierde
+vehículos entre frames, que las cajas no parpadean, que no confunde clases y que el
+umbral de confianza elegido tiene sentido. Los FPS que muestra en pantalla son **solo
+informativos**: no son los del benchmark, porque incluyen el costo de dibujar las cajas,
+el HUD y renderizar la ventana (o codificar el video de salida).
+
+No escribe nunca en `results/benchmarks/`, `results/plots/` ni `results/frames/`: toda
+su salida va a `results/preview/`.
+
+### Argumentos de `preview_detection.py`
+
+| Argumento      | Tipo  | Default                              | Descripción                                                        |
+|----------------|-------|---------------------------------------|---------------------------------------------------------------------|
+| `--video`      | str   | `None` (auto)                         | Ruta al video. Si se omite, toma el primer `.mp4` de `data/videos/`. |
+| `--model`      | str   | `preview.default_model` del config    | `model_id` a usar (debe existir en `detection.models`).             |
+| `--compare`    | str   | `None`                                 | Segundo `model_id` para vista lado a lado.                          |
+| `--export`     | flag  | `False`                                | Exporta a archivo en vez de abrir ventana.                          |
+| `--output`     | str   | `None` (auto)                          | Ruta del archivo de salida en modo export.                          |
+| `--codec`      | str   | `preview.export_codec` del config      | Codec del `VideoWriter`.                                            |
+| `--conf`       | float | `detection.confidence_threshold` del config | Umbral de confianza, para probar valores en caliente.          |
+| `--device`     | str   | `benchmark.device` del config          | `cpu` o `cuda`.                                                      |
+| `--start-sec`  | float | `0`                                     | Segundo del video donde empezar.                                    |
+| `--max-frames` | int   | `None` (video completo)                | Limita cuántos frames procesar.                                     |
+| `--fps`        | int   | `preview.playback_fps` del config      | Limita la tasa de reproducción.                                     |
+| `--no-hud`     | flag  | `False`                                 | Arranca con el HUD oculto.                                           |
+
+### Controles de teclado (modo ventana)
+
+| Tecla       | Acción                                                              |
+|-------------|-----------------------------------------------------------------------|
+| `espacio`   | Pausa / reanuda                                                       |
+| `q` / `ESC` | Salir                                                                  |
+| `s`         | Guarda el frame anotado actual en `results/preview/snapshots/`        |
+| `n` / `→`   | Estando en pausa, avanza exactamente un frame                        |
+| `h`         | Muestra/oculta el HUD (o los rótulos, en modo comparación)            |
+| `b`         | Muestra/oculta las bounding boxes                                    |
+| `+` / `-`   | Sube o baja `playback_fps` en pasos de 5 (mínimo 0 = sin límite)       |
+| `r`         | Reinicia el video desde el frame 0                                    |
+
+### Ejemplos de uso
+
+```bash
+# Ver el video con el modelo por defecto
+python scripts/preview_detection.py
+
+# Un modelo específico, empezando en el segundo 30
+python scripts/preview_detection.py --model yolo11n --start-sec 30
+
+# Probar un umbral de confianza más bajo para ver si aparecen vehículos lejanos
+python scripts/preview_detection.py --conf 0.25
+
+# Comparar dos modelos lado a lado
+python scripts/preview_detection.py --model yolov8n --compare yolov8m
+
+# Exportar un video anotado (para el informe o la defensa)
+python scripts/preview_detection.py --model yolov8n --export --max-frames 600
+
+# En Raspberry Pi por SSH (sin display): cae solo a modo exportación
+python scripts/preview_detection.py --device cpu --export
+```
+
+**Codecs:** si el `.mp4` sale corrupto o de 0 bytes, usa `--codec XVID` con un nombre de
+salida terminado en `.avi` (`--output resultado.avi`).
+
+**Raspberry Pi 4:** `cv2.imshow` requiere una instalación de `opencv-python` con soporte
+de GUI; en instalaciones headless (por SSH, sin X) conviene usar siempre `--export`. El
+script detecta automáticamente la ausencia de display y cae a modo exportación por su
+cuenta, pero pasar `--export` explícitamente evita la advertencia y dejará el archivo
+donde se indique con `--output`.
+
 ## Notas para hardware embebido
 
 - El benchmark corre por defecto con `--device cpu` para aproximar las condiciones

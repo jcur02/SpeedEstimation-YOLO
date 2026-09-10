@@ -47,3 +47,16 @@ paths:
   benchmarks: "results/benchmarks/"
   plots: "results/plots/"
   frames: "results/frames/"
+
+preview:
+  default_model: "yolov8n"      # Modelo por defecto para la visualización
+  max_display_width: 1280       # Si el video es más ancho, se reescala solo para mostrar
+  playback_fps: 0                # 0 = tan rápido como pueda; >0 = limita a esa tasa
+  show_hud: true                 # Panel de información sobre el video
+  show_confidence: true          # Mostrar el valor de confianza en cada caja
+  box_thickness: 2
+  font_scale: 0.5
+  fps_window: 30                 # Frames para el promedio móvil de FPS mostrado en pantalla
+  export_codec: "mp4v"           # Codec para el video exportado
+  export_dir: "results/preview/"
+  snapshots_dir: "results/preview/snapshots/"
