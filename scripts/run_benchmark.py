@@ -16,6 +16,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.detection.benchmark import YOLOBenchmark
+from src.utils.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -53,30 +54,6 @@ def parse_args():
         help="Sobreescribe el dispositivo de inferencia (cpu o cuda).",
     )
     return parser.parse_args()
-
-
-def setup_logging(results_dir):
-    """
-    Configura el logging global del script en nivel INFO, con salida a
-    consola y a un archivo `benchmark.log` dentro de `results_dir`.
-
-    Parámetros:
-        results_dir (str): directorio donde se guardará el log.
-
-    Retorna:
-        None
-    """
-    os.makedirs(results_dir, exist_ok=True)
-    log_path = os.path.join(results_dir, "benchmark.log")
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
 
 
 def find_video(videos_dir):

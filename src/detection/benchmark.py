@@ -4,6 +4,9 @@ Benchmarking comparativo de variantes YOLO para detección vehicular.
 import json
 import logging
 import os
+import subprocess
+import sys
+import tempfile
 import time
 from datetime import datetime
 
@@ -12,13 +15,16 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import yaml
 
-from src.detection.detector import VehicleDetector
 from src.utils.metrics import SystemMetrics
 
 logger = logging.getLogger(__name__)
 
 _VEHICLE_CLASS_NAMES = ["car", "truck", "bus", "motorcycle"]
+# Raíz del proyecto (src/detection/benchmark.py -> src/detection -> src -> raíz),
+# necesaria para invocar el worker aislado como `python -m src.detection.worker`.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class YOLOBenchmark:
@@ -189,8 +195,15 @@ class YOLOBenchmark:
         el video de prueba, guarda los resultados y genera las gráficas
         comparativas.
 
-        Si un modelo falla al cargar o al procesarse, el error se registra
-        y se continúa con el siguiente modelo (no aborta todo el benchmark).
+        Cada modelo se evalúa en un subproceso propio (`src.detection.worker`)
+        en lugar de en el proceso actual: PyTorch no siempre libera la memoria
+        de un modelo antes de cargar el siguiente, así que medir varios modelos
+        de forma secuencial en un mismo proceso infla la RAM de los que se
+        evalúan más tarde. Un proceso nuevo por modelo da una medición de RAM
+        limpia, independiente del orden de evaluación.
+
+        Si un modelo falla al cargar o al procesarse, el error se registra y
+        se continúa con el siguiente modelo (no aborta todo el benchmark).
 
         Retorna:
             list[dict]: lista de resúmenes, uno por modelo evaluado exitosamente.
@@ -198,38 +211,68 @@ class YOLOBenchmark:
         all_frame_data = []
         all_summaries = []
         total = len(self.models)
+        config_path = self._write_temp_config()
 
-        for idx, model_cfg in enumerate(self.models, start=1):
-            model_id = model_cfg["id"]
-            weights = model_cfg["weights"]
-            print(f"\n[{idx}/{total}] Evaluando modelo: {model_id}...")
-            logger.info("[%d/%d] Evaluando modelo: %s", idx, total, model_id)
+        try:
+            for idx, model_cfg in enumerate(self.models, start=1):
+                model_id = model_cfg["id"]
+                weights = model_cfg["weights"]
+                print(f"\n[{idx}/{total}] Evaluando modelo: {model_id}...")
+                logger.info("[%d/%d] Evaluando modelo: %s", idx, total, model_id)
 
-            try:
-                detector = VehicleDetector(model_id, weights, self.config)
-                model_info = detector.get_model_info()
-                print(f"  ✓ Modelo cargado ({model_info['parameters_M']:.1f} M parámetros)")
+                fd, output_path = tempfile.mkstemp(suffix=".json", prefix=f"yolo_{model_id}_")
+                os.close(fd)
 
-                frame_data = self._process_video(detector)
-                if not frame_data:
-                    logger.warning("El modelo %s no produjo frames procesados; se omite.", model_id)
-                    print(f"  ✗ {model_id}: no se procesó ningún frame (video vacío o muy corto)")
+                try:
+                    proc = subprocess.run(
+                        [
+                            sys.executable, "-m", "src.detection.worker",
+                            "--config", config_path,
+                            "--video", self.video_path,
+                            "--model-id", model_id,
+                            "--weights", weights,
+                            "--output", output_path,
+                        ],
+                        cwd=_PROJECT_ROOT,
+                    )
+
+                    try:
+                        with open(output_path, "r", encoding="utf-8") as f:
+                            result = json.load(f)
+                    except (OSError, json.JSONDecodeError):
+                        result = None
+
+                    if result is None or "error" in result:
+                        reason = result["error"] if result else f"el worker terminó con código {proc.returncode}"
+                        raise RuntimeError(reason)
+
+                    frame_data = result["frame_data"]
+                    summary = result["summary"]
+
+                    if not frame_data:
+                        logger.warning("El modelo %s no produjo frames procesados; se omite.", model_id)
+                        print(f"  ✗ {model_id}: no se procesó ningún frame (video vacío o muy corto)")
+                        continue
+
+                    all_frame_data.extend({"model_id": model_id, **row} for row in frame_data)
+                    all_summaries.append(summary)
+
+                    print(
+                        f"  ✓ {model_id} completado: "
+                        f"{summary['fps_mean']:.1f} FPS | "
+                        f"{summary['inference_ms_mean']:.1f} ms | "
+                        f"{summary['ram_mb_mean']:.0f} MB RAM"
+                    )
+                except Exception as exc:
+                    logger.error("Error evaluando el modelo %s: %s", model_id, exc, exc_info=True)
+                    print(f"  ✗ Error evaluando {model_id}: {exc}")
                     continue
-
-                summary = self._compute_summary(model_info, frame_data)
-                all_frame_data.extend({"model_id": model_id, **row} for row in frame_data)
-                all_summaries.append(summary)
-
-                print(
-                    f"  ✓ {model_id} completado: "
-                    f"{summary['fps_mean']:.1f} FPS | "
-                    f"{summary['inference_ms_mean']:.1f} ms | "
-                    f"{summary['ram_mb_mean']:.0f} MB RAM"
-                )
-            except Exception as exc:
-                logger.error("Error evaluando el modelo %s: %s", model_id, exc, exc_info=True)
-                print(f"  ✗ Error evaluando {model_id}: {exc}")
-                continue
+                finally:
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+        finally:
+            if os.path.exists(config_path):
+                os.remove(config_path)
 
         if not all_summaries:
             logger.error("Ningún modelo pudo evaluarse correctamente.")
@@ -240,6 +283,19 @@ class YOLOBenchmark:
         self._generate_plots(all_summaries, timestamp)
 
         return all_summaries
+
+    def _write_temp_config(self):
+        """
+        Serializa la configuración actual a un archivo YAML temporal, para
+        poder pasársela tal cual a los procesos worker (uno por modelo).
+
+        Retorna:
+            str: ruta al archivo YAML temporal creado.
+        """
+        fd, path = tempfile.mkstemp(suffix=".yaml", prefix="yolo_bench_config_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.safe_dump(self.config, f)
+        return path
 
     def _save_results(self, all_frame_data, all_summaries):
         """
