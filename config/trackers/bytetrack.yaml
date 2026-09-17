@@ -1,0 +1,38 @@
+# Copia local de la configuración de ByteTrack para mode="track" de Ultralytics.
+#
+# Se versiona en el repositorio (en vez de referenciar el YAML interno de la
+# librería) por dos razones: (1) reproducibilidad — los parámetros usados en
+# cada corrida quedan trazables en git, y (2) se pueden ajustar sin tocar la
+# instalación de la librería.
+#
+# ByteTrack asocia detecciones a tracks en dos pasadas por umbral de
+# confianza (alto y bajo) usando únicamente IoU + movimiento — no usa
+# apariencia visual. Es más liviano que BoTSORT, lo que lo hace el candidato
+# natural para la Raspberry Pi 4.
+
+tracker_type: bytetrack  # Backend de seguimiento. No cambiar sin renombrar este archivo.
+
+# --- Umbrales de asociación (primera y segunda pasada) ---
+track_high_thresh: 0.5     # Confianza mínima para la asociación de "alta calidad" (primera pasada)
+track_low_thresh: 0.1      # Confianza mínima para la asociación de "recuperación" (segunda pasada,
+                            # intenta rescatar detecciones débiles que ya tienen un track cercano)
+new_track_thresh: 0.6      # Confianza mínima para abrir un track NUEVO. Deliberadamente más alta que
+                            # track_high_thresh: evita que un falso positivo puntual arranque un ID.
+
+# --- El parámetro más relevante para oclusiones ---
+track_buffer: 30           # Cuántos frames se conserva un track sin detecciones antes de darlo por
+                            # perdido. Si un vehículo pasa detrás de un poste o de otro vehículo, este
+                            # valor decide si recupera su ID original al reaparecer o si arranca un ID
+                            # nuevo (lo que infla el conteo de "vehículos únicos" y corta la
+                            # trayectoria en dos). Subirlo ayuda con oclusiones largas pero aumenta el
+                            # riesgo de "pegar" el ID de un vehículo perdido a otro que pasa cerca
+                            # mientras el primero sigue "buscándose". Con video a 30 FPS, 30 frames = 1s.
+
+# --- Asociación final ---
+match_thresh: 0.8          # Umbral de similitud (IoU) para aceptar una asociación detección-track.
+                            # Subirlo exige cajas más parecidas para emparejar (menos errores, más
+                            # tracks perdidos); bajarlo es más permisivo (menos tracks perdidos, más
+                            # riesgo de emparejar el vehículo equivocado).
+fuse_score: true            # Combina el score de confianza de la detección con el costo de movimiento
+                            # al emparejar. Ayuda a que detecciones de baja confianza no "ganen" un
+                            # emparejamiento solo por estar geométricamente cerca.

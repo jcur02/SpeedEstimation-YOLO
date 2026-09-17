@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.detection.detector import VehicleDetector
 from src.detection.visualizer import DetectionVisualizer
+from src.tracking.tracker import VehicleTracker
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,26 @@ def parse_args() -> argparse.Namespace:
         "--roi-file", type=str, default=None,
         help="Ruta del archivo de ROI a usar. Default: roi.file del config.",
     )
+    parser.add_argument(
+        "--track", action="store_true",
+        help="Activa el modo seguimiento (IDs persistentes, estelas) en vez de solo detección.",
+    )
+    parser.add_argument(
+        "--tracker", type=str, default=None, choices=["bytetrack", "botsort"],
+        help="Tracker a usar con --track. Default: tracking.default_tracker del config.",
+    )
+    parser.add_argument(
+        "--compare-tracker", type=str, default=None, choices=["bytetrack", "botsort"],
+        help="Segundo tracker (mismo modelo) para vista lado a lado. Requiere --track.",
+    )
+    parser.add_argument(
+        "--trail", type=int, default=None,
+        help="Longitud de la estela en frames. Default: tracking.visualization.trail_length del config.",
+    )
+    parser.add_argument(
+        "--no-trail", action="store_true",
+        help="Arranca con las estelas ocultas.",
+    )
     return parser.parse_args()
 
 
@@ -221,7 +242,7 @@ def resolve_model(config: dict, model_id: "str | None", role: str) -> dict:
 
 
 def print_banner(video_path: str, visualizer: DetectionVisualizer, model_id: str,
-                  conf: float, device: str, mode_desc: str) -> None:
+                  conf: float, device: str, mode_desc: str, tracking_active: bool = False) -> None:
     """
     Imprime el encabezado con la configuración efectiva antes de arrancar.
 
@@ -233,6 +254,8 @@ def print_banner(video_path: str, visualizer: DetectionVisualizer, model_id: str
         conf (float): umbral de confianza efectivo.
         device (str): dispositivo de inferencia efectivo.
         mode_desc (str): descripción del modo de ejecución elegido.
+        tracking_active (bool): si es True, agrega la línea de controles
+            propios del modo seguimiento (estelas, IDs, color).
 
     Retorna:
         None
@@ -252,7 +275,11 @@ def print_banner(video_path: str, visualizer: DetectionVisualizer, model_id: str
     print("╚" + "═" * box_width + "╝")
 
     print("\nControles: [espacio] pausa · [n] siguiente frame · [s] captura")
-    print("           [b] cajas · [h] HUD · [+/-] velocidad · [r] reiniciar · [q] salir\n")
+    print("           [b] cajas · [h] HUD · [+/-] velocidad · [r] reiniciar · [q] salir")
+    if tracking_active:
+        print("           [t] estelas · [i] IDs · [c] color por ID/clase · [[/]] largo de estela\n")
+    else:
+        print()
 
 
 def main() -> None:
@@ -283,6 +310,14 @@ def main() -> None:
         print(f"✗ El video especificado no existe: {video_path}")
         sys.exit(1)
 
+    if args.track and args.compare:
+        print("✗ No se puede combinar --compare (comparar modelos) con --track. "
+              "Para comparar dos trackers del mismo modelo, usá --compare-tracker.")
+        sys.exit(1)
+    if args.compare_tracker and not args.track:
+        print("✗ --compare-tracker requiere --track.")
+        sys.exit(1)
+
     model_cfg = resolve_model(config, args.model, "principal")
     compare_cfg = resolve_model(config, args.compare, "de comparación") if args.compare else None
 
@@ -296,6 +331,24 @@ def main() -> None:
             detector_b = VehicleDetector(compare_cfg["id"], compare_cfg["weights"], config)
 
         visualizer = DetectionVisualizer(config, detector, video_path)
+
+        tracker_obj = None
+        tracker_b_obj = None
+        if args.track:
+            tracker_name = args.tracker or config.get("tracking", {}).get("default_tracker", "bytetrack")
+            logger.info("Construyendo tracker principal: %s + %s", model_cfg["id"], tracker_name)
+            tracker_obj = VehicleTracker(
+                model_cfg["id"], model_cfg["weights"], tracker_name, config, visualizer.source_fps,
+            )
+            visualizer.tracker = tracker_obj
+
+            if args.compare_tracker:
+                logger.info(
+                    "Construyendo tracker de comparación: %s + %s", model_cfg["id"], args.compare_tracker,
+                )
+                tracker_b_obj = VehicleTracker(
+                    model_cfg["id"], model_cfg["weights"], args.compare_tracker, config, visualizer.source_fps,
+                )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         print(f"✗ Error inicializando la vista previa: {exc}")
         sys.exit(1)
@@ -309,16 +362,29 @@ def main() -> None:
     visualizer.max_frames = args.max_frames
     if args.no_hud:
         visualizer.show_hud = False
+    if args.trail is not None:
+        visualizer.trail_length = args.trail
+    if args.no_trail:
+        visualizer.show_trails = False
 
     compare_requested = detector_b is not None
+    compare_tracker_requested = tracker_b_obj is not None
     want_export = args.export
     if not want_export and visualizer._headless_check():
         print("⚠ No se detectó un display disponible (SSH sin X / entorno headless). "
               "Se cambia automáticamente a modo exportación.")
         want_export = True
 
-    if compare_requested:
+    if compare_tracker_requested:
+        mode_desc = f"comparación de trackers {args.tracker} vs {args.compare_tracker} — " + (
+            "exportación a archivo" if want_export else "ventana interactiva"
+        )
+    elif compare_requested:
         mode_desc = f"comparación {model_cfg['id']} vs {compare_cfg['id']} — " + (
+            "exportación a archivo" if want_export else "ventana interactiva"
+        )
+    elif args.track:
+        mode_desc = f"seguimiento ({tracker_obj.tracker_name}) — " + (
             "exportación a archivo" if want_export else "ventana interactiva"
         )
     elif want_export:
@@ -329,10 +395,13 @@ def main() -> None:
     print_banner(
         video_path, visualizer, model_cfg["id"],
         config["detection"]["confidence_threshold"], config["benchmark"]["device"], mode_desc,
+        tracking_active=args.track,
     )
 
     try:
-        if compare_requested:
+        if compare_tracker_requested:
+            visualizer.run_compare(tracker_b=tracker_b_obj, export=want_export, output_path=args.output)
+        elif compare_requested:
             visualizer.run_compare(detector_b, export=want_export, output_path=args.output)
         elif want_export:
             visualizer.run_export(args.output)

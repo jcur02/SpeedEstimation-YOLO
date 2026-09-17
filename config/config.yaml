@@ -80,3 +80,23 @@ roi:
     blur_kernel: 41                 # Suavizado gaussiano del mapa acumulado (impar)
     colormap: "COLORMAP_JET"
     alpha: 0.45                      # Mezcla del mapa sobre el frame de fondo
+
+tracking:
+  enabled: false
+  default_tracker: "bytetrack"      # "bytetrack" | "botsort"
+  tracker_config_dir: "config/trackers/"
+  tracks_dir: "results/tracks/"
+
+  smoothing_window: 5               # Media móvil sobre los puntos de contacto (impar, 0 = sin suavizar)
+  min_track_frames: 10              # Menos que esto se considera fragmento
+  min_displacement_px: 40           # Menos que esto se considera vehículo estacionado
+  border_margin_px: 20              # Margen para considerar que un bbox toca el borde del frame
+
+  visualization:
+    trail_length: 40                # Puntos de estela conservados por ID
+    trail_ttl_frames: 15            # Frames que sobrevive la estela de un ID perdido
+    color_by_id: true                # false = colorear por clase
+    show_ids: true
+    show_trails: true
+    show_lost_trails: true          # Estelas grises de tracks recién perdidos
+    id_font_scale: 0.6

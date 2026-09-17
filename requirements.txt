@@ -1,6 +1,9 @@
 # PyTorch se instala por separado (ver instrucciones de instalación en el README)
 # ultralytics detecta y usa automáticamente el torch ya instalado
 ultralytics>=8.2.0
+# lap: usado internamente por model.track() (ByteTrack/BoTSORT) para la asociación
+# detección-track; Ultralytics lo requiere en tiempo de ejecución para mode="track".
+lap>=0.5.12
 opencv-python>=4.8.0
 numpy>=1.24.0
 pandas>=2.0.0

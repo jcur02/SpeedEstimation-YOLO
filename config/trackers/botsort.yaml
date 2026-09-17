@@ -1,0 +1,58 @@
+# Copia local de la configuración de BoT-SORT para mode="track" de Ultralytics.
+#
+# Se versiona en el repositorio (en vez de referenciar el YAML interno de la
+# librería) por dos razones: (1) reproducibilidad — los parámetros usados en
+# cada corrida quedan trazables en git, y (2) se pueden ajustar sin tocar la
+# instalación de la librería.
+#
+# BoT-SORT extiende a ByteTrack con compensación de movimiento de cámara y,
+# opcionalmente, re-identificación por apariencia (ReID). Es más robusto en
+# escenas difíciles pero más pesado — la comparación empírica de esta fase
+# (scripts/run_tracking_benchmark.py) existe justamente para cuantificar ese
+# costo adicional en hardware limitado.
+
+tracker_type: botsort  # Backend de seguimiento. No cambiar sin renombrar este archivo.
+
+# --- Umbrales de asociación (primera y segunda pasada) ---
+track_high_thresh: 0.5     # Confianza mínima para la asociación de "alta calidad" (primera pasada)
+track_low_thresh: 0.1      # Confianza mínima para la asociación de "recuperación" (segunda pasada)
+new_track_thresh: 0.6      # Confianza mínima para abrir un track nuevo (más alta a propósito, ver
+                            # bytetrack.yaml para el razonamiento completo)
+
+# --- El parámetro más relevante para oclusiones ---
+track_buffer: 30           # Cuántos frames se conserva un track sin detecciones antes de darlo por
+                            # perdido. Es el parámetro más relevante para oclusiones: si un vehículo
+                            # pasa detrás de un poste, este valor decide si recupera su ID al reaparecer
+                            # o si arranca uno nuevo. Ver bytetrack.yaml para el detalle del tradeoff.
+
+# --- Asociación final ---
+match_thresh: 0.8          # Umbral de similitud para aceptar una asociación detección-track.
+fuse_score: true            # Combina el score de confianza con el costo de movimiento al emparejar.
+
+# --- Compensación de movimiento de cámara (GMC) ---
+gmc_method: sparseOptFlow  # Estima el movimiento de la cámara entre frames (flujo óptico disperso) y
+                            # lo compensa antes de asociar tracks. Con cámara FIJA — el caso de este
+                            # proyecto — su beneficio es marginal (no hay movimiento de cámara que
+                            # compensar) y consume tiempo de CPU en cada frame. Se deja en su valor por
+                            # defecto porque es lo que trae Ultralytics, pero en este proyecto es
+                            # candidato directo a desactivar (usar "none") si se necesita exprimir FPS
+                            # en la Raspberry Pi; no se cambia acá para no alterar el comportamiento
+                            # "de fábrica" que se está comparando contra ByteTrack.
+
+# --- Re-identificación por apariencia (ReID) ---
+proximity_thresh: 0.5      # IoU mínimo para considerar dos tracks "próximos" y evaluar su apariencia
+                            # con ReID en vez de descartar el emparejamiento directamente por distancia.
+appearance_thresh: 0.25    # Similitud de apariencia mínima (solo aplica si with_reid=true) para
+                            # aceptar un emparejamiento por ReID.
+with_reid: false            # Activa la re-identificación por apariencia (una red extra que compara
+                            # "cómo se ve" cada vehículo, no solo su posición). Mejora la robustez ante
+                            # oclusiones largas y cruces de trayectorias, pero aumenta notablemente el
+                            # costo de cómputo por frame (una pasada de red adicional). Se deja
+                            # deliberadamente en false por defecto: activarlo requiere pesos de un
+                            # modelo de ReID adicional (no incluidos en este repo) y cuesta FPS que la
+                            # Raspberry Pi probablemente no tiene para dar. Que el usuario decida
+                            # explícitamente si quiere medir esa variante, cambiando este valor y
+                            # proveyendo el modelo de ReID correspondiente.
+model: auto                 # Modelo de ReID a usar cuando with_reid=true ("auto" usa las features del
+                            # propio detector). Ultralytics lo requiere presente en el YAML incluso con
+                            # with_reid=false, así que se deja explícito para no romper la carga.

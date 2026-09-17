@@ -294,6 +294,180 @@ no está disponible (sesión SSH sin X, como en la Raspberry Pi), el script lo d
 imprime un error explicando que la ROI debe marcarse en una máquina con interfaz gráfica.
 El `roi.json` resultante puede copiarse luego a la Raspberry Pi sin volver a marcarlo.
 
+## Seguimiento multi-objeto
+
+Sin identidad persistente no existe la velocidad: la velocidad es el desplazamiento del
+**mismo** vehículo entre dos instantes. Hasta acá, el sistema detecta de forma
+independiente en cada frame y no tiene forma de saber que el vehículo del frame 100 es
+el mismo del frame 130. Esta fase agrega seguimiento multi-objeto (ByteTrack y BoTSORT,
+ambos ya integrados en Ultralytics — no se reimplementa ningún algoritmo de seguimiento
+a mano), produce trayectorias con identificadores estables, y compara empíricamente
+ambos trackers sobre los 5 modelos. El producto principal es un **archivo de
+trayectorias** (`results/tracks/*.json`) que será la entrada directa de la etapa de
+estimación de velocidad.
+
+### La base de tiempo: el error más peligroso de esta etapa
+
+El tiempo asociado a un frame se calcula siempre como:
+
+```python
+t_video = frame_idx / source_fps
+```
+
+**Nunca** con `time.time()`, `time.perf_counter()` ni ningún reloj del sistema.
+
+Razón: en la Raspberry Pi 4 el procesamiento correrá más lento que tiempo real — por
+ejemplo, 8 FPS procesando un video grabado a 30 FPS. Si el tiempo se midiera con el
+reloj de pared, todas las velocidades saldrían subestimadas por un factor cercano a 4.
+Es un error **silencioso**: los números resultantes parecen plausibles, simplemente
+están mal. Por eso existe la clase `TimeBase` (`src/tracking/track.py`) como punto único
+y explícito de cálculo del tiempo. La etapa de velocidad debe leer el campo `t_video` de
+cada observación del JSON de trayectorias — nunca recalcularlo con un reloj propio.
+
+### Advertencia metodológica sobre las métricas de calidad
+
+Las métricas estándar de seguimiento multi-objeto (MOTA, HOTA, IDF1, cambios de
+identidad reales) requieren **anotaciones manuales de verdad de referencia**, que este
+trabajo no posee. Las métricas de `src/tracking/quality.py` son **indicadores
+indirectos**, calculados sin verdad de referencia. Son útiles para comparar trackers
+entre sí sobre el mismo video, que es exactamente lo que se necesita acá, pero **no son
+MOTA ni HOTA y no deben reportarse como tales** en el informe.
+
+### ByteTrack vs. BoTSORT
+
+| | ByteTrack | BoTSORT |
+|---|---|---|
+| Asociación | IoU + movimiento, dos pasadas por umbral de confianza | Igual que ByteTrack, más compensación de movimiento de cámara (GMC) |
+| Re-identificación por apariencia | No | Opcional (`with_reid`, apagado por defecto) |
+| Costo | Más liviano | Más pesado — especialmente con `with_reid` activado |
+| Cámara fija (este proyecto) | Candidato natural para la RPi4 | El GMC no aporta mucho con cámara fija y cuesta tiempo |
+| Cuándo preferirlo | Por defecto, y siempre que el presupuesto de FPS sea ajustado | Escenas con cruces de trayectorias frecuentes o oclusiones muy largas, si sobra presupuesto de cómputo |
+
+La comparación empírica de `scripts/run_tracking_benchmark.py` existe para no tener que
+adivinar cuál conviene en el hardware real.
+
+### Argumentos nuevos de `preview_detection.py`
+
+| Argumento | Default | Descripción |
+|---|---|---|
+| `--track` | `False` | Activa el modo seguimiento. |
+| `--tracker` | `tracking.default_tracker` del config | `bytetrack` o `botsort`. |
+| `--compare-tracker` | `None` | Segundo tracker (mismo modelo) para vista lado a lado. Requiere `--track`. |
+| `--trail` | `tracking.visualization.trail_length` del config | Longitud de la estela en frames. |
+| `--no-trail` | `False` | Arranca con las estelas ocultas. |
+
+### Argumentos de `run_tracking_benchmark.py`
+
+| Argumento | Tipo | Default | Descripción |
+|---|---|---|---|
+| `--video` | str | auto | Video a procesar. |
+| `--models` | str | todos | Lista de `model_id` separados por coma. |
+| `--trackers` | str | `bytetrack,botsort` | Trackers a comparar. |
+| `--conf` | float | del config | Umbral de confianza. |
+| `--device` | str | del config | `cpu` o `cuda`. |
+| `--max-frames` | int | `None` | Limita frames por corrida, para pruebas rápidas. |
+| `--fps` | float | `None` | Fuerza los FPS si el video los reporta mal. |
+| `--no-save-tracks` | flag | `False` | No escribe los JSON de trayectorias. |
+
+### Controles de teclado (modo seguimiento)
+
+Además de los controles del modo de solo detección (espacio, `q`/ESC, `s`, `n`, `h`,
+`b`, `+`/`-`, `r`):
+
+| Tecla | Acción |
+|---|---|
+| `t` | Muestra/oculta las estelas |
+| `i` | Muestra/oculta los IDs |
+| `c` | Alterna color por ID / por clase |
+| `[` / `]` | Acorta o alarga la estela en pasos de 10 frames |
+
+### Esquema del JSON de trayectorias
+
+Entrada directa de la etapa de estimación de velocidad. Cada observación trae su
+`t_video` ya calculado con `TimeBase` — **la etapa de velocidad debe leerlo de acá,
+nunca recalcularlo**:
+
+```json
+{
+  "version": 1,
+  "created_at": "2026-09-16T10:22:41",
+  "source_video": "data/videos/sitio_a_01.mp4",
+  "frame_size": [1920, 1080],
+  "source_fps": 29.97,
+  "model_id": "yolov8n",
+  "tracker": "bytetrack",
+  "confidence_threshold": 0.4,
+  "smoothing_window": 5,
+  "total_frames_processed": 900,
+  "tracks": [
+    {
+      "track_id": 3,
+      "class_name": "car",
+      "first_frame": 112, "last_frame": 268,
+      "first_seen_t": 3.737, "last_seen_t": 8.942,
+      "length_frames": 157,
+      "total_displacement_px": 842.3,
+      "is_stationary": false,
+      "observations": [
+        {"frame_idx": 112, "t_video": 3.737, "bbox": [820, 410, 910, 470],
+         "confidence": 0.86, "ground_point": [865.0, 470.0]}
+      ]
+    }
+  ]
+}
+```
+
+### Guía de lectura visual: ¿el tracker está funcionando?
+
+- **Colores estables**: si un vehículo conserva su color a lo largo de toda la escena,
+  el seguimiento es correcto. Si cambia de color a media cuadra, acaba de ocurrir un
+  cambio de identidad — a simple vista, sin necesitar ninguna métrica.
+- **Estelas continuas y suaves**: una estela quebrada o que salta bruscamente de lugar
+  indica una asociación errónea entre frames.
+- **IDs que no saltan entre vehículos cercanos**: en cruces o adelantamientos, el ID
+  debe seguir al mismo vehículo, no "pegarse" al más cercano del frame siguiente.
+- **Comportamiento en oclusiones** (un vehículo pasa detrás de un poste, otro vehículo,
+  o sale del encuadre y vuelve a entrar): si recupera su ID original, el `track_buffer`
+  del tracker está bien calibrado para esa oclusión. Si arranca un ID nuevo, subí
+  `track_buffer` en `config/trackers/{bytetrack,botsort}.yaml` — es **el parámetro más
+  relevante para oclusiones**. Si en cambio dos vehículos distintos terminan compartiendo
+  un ID, `track_buffer` está probablemente demasiado alto para la densidad de tráfico de
+  la escena; bajalo.
+- **Falsos arranques de ID** (un ID nuevo aparece sin que haya un vehículo nuevo en
+  escena): subí `new_track_thresh`.
+
+### Cómo leer la comparación y la gráfica de compromiso
+
+`scripts/run_tracking_benchmark.py` genera `results/plots/tracking_tradeoff.png`: FPS
+contra `identity_instability` (el indicador indirecto de cambios de identidad), con cada
+combinación modelo+tracker etiquetada. Es la gráfica que justifica la elección final y
+la que va al informe: la combinación ideal está arriba (más FPS) y a la izquierda (menor
+inestabilidad); todo lo demás es un compromiso entre ambos ejes. `tracking_quality.png`
+desglosa `identity_instability` y `fragment_ratio` por combinación, y
+`tracking_fps_comparison.png` muestra el FPS puro de cada modelo agrupado por tracker.
+La tabla en consola también reporta el overhead de tracking sobre la detección pura del
+mismo modelo (si existe un benchmark de detección previo en `results/benchmarks/`), para
+cuantificar cuánto cuesta agregar seguimiento en la Raspberry Pi.
+
+### Ejemplos de uso
+
+```bash
+# Ver el seguimiento con estelas
+python scripts/preview_detection.py --track --tracker bytetrack
+
+# Comparar los dos trackers lado a lado
+python scripts/preview_detection.py --track --tracker bytetrack --compare-tracker botsort
+
+# Matriz completa 5 modelos x 2 trackers
+python scripts/run_tracking_benchmark.py
+
+# Prueba rápida
+python scripts/run_tracking_benchmark.py --models yolov8n --max-frames 300
+
+# Exportar video anotado con IDs y estelas para el informe
+python scripts/preview_detection.py --track --export
+```
+
 ## Notas para hardware embebido
 
 - El benchmark corre por defecto con `--device cpu` para aproximar las condiciones

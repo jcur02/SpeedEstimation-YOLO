@@ -17,6 +17,7 @@ models/*.pt
 data/videos/*.mp4
 data/videos/*.avi
 data/videos/*.mov
+data/videos/*.MOV
 data/videos/*.mkv
 
 # Resultados generados por el benchmark
