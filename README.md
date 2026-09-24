@@ -355,6 +355,8 @@ adivinar cuál conviene en el hardware real.
 | `--compare-tracker` | `None` | Segundo tracker (mismo modelo) para vista lado a lado. Requiere `--track`. |
 | `--trail` | `tracking.visualization.trail_length` del config | Longitud de la estela en frames. |
 | `--no-trail` | `False` | Arranca con las estelas ocultas. |
+| `--speed` | `False` | Overlay de velocidad en vivo (km/h junto al ID). Requiere `--track` y una calibración (ver [Vista previa en vivo](#vista-previa-en-vivo)). |
+| `--calibration` | `calibration.file` del config | Ruta a `calibration.json` para `--speed`. |
 
 ### Argumentos de `run_tracking_benchmark.py`
 
@@ -467,6 +469,359 @@ python scripts/run_tracking_benchmark.py --models yolov8n --max-frames 300
 # Exportar video anotado con IDs y estelas para el informe
 python scripts/preview_detection.py --track --export
 ```
+
+## Calibración por homografía
+
+**Esta fase no calcula velocidades.** Toma las trayectorias en píxeles que ya produce el
+seguimiento (`results/tracks/*.json`) y prepara la pieza que falta para convertirlas a
+metros: una matriz de homografía. La estimación de velocidad en sí es una fase posterior
+y separada.
+
+Una homografía es una transformación 2D que mapea cualquier punto **del plano de la
+calzada** en la imagen a su coordenada métrica real. No hace falta calibrar los parámetros
+intrínsecos de la cámara (distancia focal, distorsión de lente) porque no se reconstruye
+una escena 3D completa — solo se necesita la relación entre un plano (la calle) visto en
+perspectiva y su versión plana en metros, y cuatro o más puntos de correspondencia bastan
+para resolverla.
+
+**Supuesto central, y hay que subrayarlo: la homografía solo es válida para puntos sobre
+el plano de la calzada.** Un vehículo en una rampa, un puente o cualquier otro plano
+produce, con esta misma matriz, una conversión a metros sin sentido — la homografía no
+sabe que ese punto no está sobre el asfalto, simplemente proyecta como si lo estuviera.
+
+Una calibración silenciosamente mala produce velocidades que **parecen razonables pero
+están sistemáticamente equivocadas** (todas un 20% más altas, por ejemplo) sin que nada se
+vea roto en el camino. Por eso la herramienta dedica tanto esfuerzo a cuantificar la
+confiabilidad (validación cruzada, mapa de escala, vista cenital) como a calcular la
+matriz en sí.
+
+### Cómo obtener las coordenadas de cada punto
+
+Clic derecho sobre el punto exacto en Google Maps y elegir las coordenadas: eso entrega
+la precisión necesaria (7+ decimales). **Menos de 5 decimales se rechaza automáticamente**
+— con 4 decimales el error posicional ya supera el metro, y eso arruina la calibración sin
+que se note hasta que las velocidades salgan mal. En la séptima cifra decimal cada unidad
+vale aproximadamente un centímetro.
+
+Qué puntos elegir: marcas pintadas sobre el asfalto — esquinas de cruces peatonales,
+extremos de líneas discontinuas, bordes de flechas viales. **Evitá bases de postes o
+esquinas de edificios**: si se comparan contra una imagen satelital, esos objetos altos
+aparecen con la base desplazada porque la imagen no está perfectamente ortorectificada, y
+el punto marcado en la aérea termina correspondiendo a un lugar distinto del real.
+Repartí los puntos por toda la zona de interés — cerca y lejos de la cámara, izquierda y
+derecha — nunca agrupados en una sola esquina: la homografía **extrapola** fuera de la
+zona cubierta por los puntos, y la extrapolación en perspectiva se degrada rápido.
+
+**Por qué marcar 6 u 8 puntos en vez de 4:** con exactamente 4 puntos el ajuste es exacto
+y el error de reproyección sobre esos mismos puntos es cero por definición, sin importar
+cuán mala sea la calibración — una homografía tiene 8 grados de libertad y 4 puntos
+aportan exactamente 8 ecuaciones. Sin puntos sobrantes no hay forma de medir la capacidad
+real de generalizar. Con 6 u 8 puntos, la validación cruzada (dejar uno fuera, ajustar con
+el resto, medir el error sobre el excluido) sí es posible y es la métrica que de verdad
+importa.
+
+### Arquitectura: archivo primero, imagen aérea opcional
+
+La fuente de verdad es un archivo de puntos de correspondencia; el cálculo de la
+homografía lee ese archivo y nada más — funciona sin red, sin llave de API y sin interfaz
+gráfica, porque el destino final es una Raspberry Pi que puede correr sin conexión. El
+selector con imagen aérea (Modo A) es un front-end opcional cuyo único trabajo es escribir
+ese archivo con clics en vez de tipear latitud/longitud a mano; sin llave de MapTiler
+configurada, la herramienta cae automáticamente al modo manual y nada se rompe. La imagen
+aérea se descarga una sola vez y se guarda en disco junto a un `.meta.json` con su centro,
+zoom y tamaño — a partir de ahí el selector funciona sin red.
+
+**La llave de MapTiler va en la variable de entorno `MAPTILER_KEY`, nunca en el
+repositorio ni en el código.**
+
+### Los tres modos para obtener los puntos
+
+| Modo | Cómo se activa | Cuándo usarlo |
+|---|---|---|
+| A: imagen aérea | `--fetch-aerial --center lat,lon` o `--aerial <img>` | Marcado por pares con clics; error de reproyección en vivo desde el quinto par. Requiere `MAPTILER_KEY`. |
+| B: manual | Sin flags (default, sin imagen aérea disponible) | Clic sobre la cámara, la consola pide lat/lon de ese punto. No requiere red. |
+| C: CSV | `--points archivo.csv` | El único reproducible: el CSV se versiona en el repositorio. No requiere display. |
+
+### Tabla de argumentos de `scripts/calibrate.py`
+
+| Argumento | Default | Descripción |
+|---|---|---|
+| `--video` | auto | Video del que se toma el frame de referencia. |
+| `--frame-sec` | frame medio | Segundo del frame de referencia. |
+| `--points` | None | CSV de puntos ya preparado; salta el marcado interactivo. |
+| `--aerial` | None | Imagen aérea ya descargada (con su `.meta.json`). |
+| `--fetch-aerial` | False | Descarga la imagen aérea vía MapTiler. |
+| `--center` | None | `lat,lon` del centro para la descarga. |
+| `--zoom` | 20 | Zoom de la descarga. |
+| `--method` | `least_squares` | `least_squares` o `ransac` (umbral en **metros**, no píxeles). |
+| `--output` | `config/calibration.json` | Dónde guardar. |
+| `--verify` | False | Modo verificación sobre una calibración existente. |
+| `--show` | False | Muestra la calibración guardada y sus reportes. |
+
+### Controles del marcado interactivo
+
+| Modo A (aérea) | Acción |
+|---|---|
+| Clic (alternando cámara → aérea) | Forma un par de puntos |
+| `z` | Deshace el último par (o el clic suelto si el par está a medias) |
+| `n` | Anota el último par |
+| `Enter` | Termina (mínimo 4 pares) |
+| `q` / `ESC` | Sale sin guardar, con confirmación |
+
+| Modo B (manual) | Acción |
+|---|---|
+| Clic sobre la cámara | Marca un punto; la consola pide su lat/lon |
+| `z` | Deshace el último punto |
+| `Enter` | Termina (mínimo 4 puntos) |
+| `q` / `ESC` | Sale sin guardar, con confirmación |
+
+| `--verify` | Acción |
+|---|---|
+| Clic (dos, sobre la cámara) | Mide la distancia métrica entre ambos puntos |
+| `c` | Reinicia el par actual |
+| `q` / `ESC` | Sale |
+
+### Formato del CSV (`config/points_example.csv`)
+
+```
+label,px,py,lat,lon,note
+A,820,410,9.8574123,-83.9112345,esquina NE del cruce peatonal
+B,1100,415,9.8574087,-83.9111890,esquina NO del cruce peatonal
+```
+
+### Formato de `config/calibration.json`
+
+```json
+{
+  "version": 1,
+  "created_at": "2026-09-23T11:04:22",
+  "source_video": "data/videos/sitio_a_01.mp4",
+  "frame_size": [1920, 1080],
+  "reference_frame_md5": "a3f1...",
+  "geo_model": "local_enu_wgs84",
+  "origin": {"lat": 9.8574123, "lon": -83.9112345, "label": "A"},
+  "points": [
+    {"label": "A", "pixel": [820, 410], "latlon": [9.8574123, -83.9112345],
+     "world_m": [0.0, 0.0], "residual_m": 0.08, "used_in_fit": true,
+     "note": "esquina NE del cruce peatonal"}
+  ],
+  "homography": [["...", "...", "..."]],
+  "homography_inv": [["...", "...", "..."]],
+  "quality": { "reprojection_mean_m": 0.11, "leave_one_out": { "mean_m": 0.19 } },
+  "scale": {"min_cm_per_px": 2.4, "max_cm_per_px": 26.8, "at_centroid_cm_per_px": 7.1}
+}
+```
+
+### Cómo leer la vista cenital (`results/calibration/birdseye.png`)
+
+**La verificación visual más convincente de todas.** Rectifica el frame completo al plano
+métrico con una rejilla de un metro. Si la calibración es correcta, los bordes de la calle
+salen **rectos y paralelos**, y el ancho del carril se mantiene constante de cerca a lejos.
+Si los bordes convergen, se curvan, o el carril se ensancha con la distancia, la
+calibración está mal — y eso se ve en dos segundos, sin leer un solo número. El mapa de
+escala (`scale_map.png`) complementa esto mostrando en qué zonas la escala (cm/píxel) es
+confiable (dentro del casco convexo de los puntos) y dónde es pura extrapolación.
+
+### Guía de diagnóstico
+
+| Síntoma | Qué significa | Qué hacer |
+|---|---|---|
+| Reproyección baja, validación cruzada alta | Sobreajuste: el ajuste luce bien sobre los puntos usados pero no generaliza | No confiar en la calibración; revisar la distribución de los puntos, no solo sus coordenadas |
+| Un punto con residuo muy superior al resto | Decimal mal copiado, o esquina mal emparejada entre cámara y aérea | Revisar ese punto puntual (el reporte lo señala como `worst_point_label`) |
+| Todos los residuos altos y parecidos | Puntos fuera del plano de la calzada, o sistema de coordenadas mal construido | Revisar que todos los puntos estén sobre el asfalto y que el origen/orden sea consistente |
+| Vista cenital con bordes que convergen | Homografía inválida pese a residuos bajos | Volver a marcar con puntos mejor repartidos en profundidad |
+| Escala sobre el umbral en la zona de interés | Esa franja de la imagen no sirve para medir velocidad con suficiente precisión | Acercar la zona de medición o reubicar/acercar la cámara |
+
+### Qué expone `CalibratedPlane` a la fase de velocidad
+
+- `to_world(points_px)` / `to_pixel(points_m)`: conversión vectorizada píxel ↔ metro.
+- `scale_at(px, py)`: metros por píxel en un punto dado (útil para propagar incertidumbre).
+- `frame_size`, `quality`: metadatos de la calibración usada.
+- `check_frame(frame)`: advierte (no falla) si el frame actual no coincide con el de
+  referencia — señal de que la cámara pudo haberse movido y conviene recalibrar.
+
+### Ejemplos de uso
+
+```bash
+# Descargar imagen aérea y marcar por pares
+export MAPTILER_KEY=...
+python scripts/calibrate.py --fetch-aerial --center 9.8574,-83.9112 --zoom 20
+
+# Modo manual, sin API
+python scripts/calibrate.py
+
+# Desde un CSV versionado (reproducible)
+python scripts/calibrate.py --points config/points.csv
+
+# Verificar la escala midiendo una distancia conocida
+python scripts/calibrate.py --verify
+
+# Ver los reportes de una calibración ya hecha
+python scripts/calibrate.py --show
+```
+
+Igual que `select_roi.py`, los modos A y B son inherentemente interactivos: sin `DISPLAY`
+disponible, el script lo detecta e indica preparar un CSV con `--points` en su lugar. El
+`calibration.json` resultante puede copiarse luego a la Raspberry Pi sin volver a calibrar.
+
+## Estimación de velocidad
+
+Última fase del pipeline: convierte las trayectorias de `results/tracks/*.json` a velocidades
+en km/h, usando la homografía de `config/calibration.json`. **No hace nada con las cámaras ni
+con YOLO** — es puramente el análisis numérico de trayectorias ya calibradas.
+
+### Dos decisiones que hay que poder defender
+
+**A. El tiempo sale siempre de `t_video`, nunca de un reloj.** Cada observación de una
+trayectoria ya trae su instante calculado en la fase de seguimiento como
+`frame_idx / source_fps`. Se usa tal cual. **Nunca** se recalcula con `time.time()`,
+`time.perf_counter()` ni ningún reloj del sistema: en la Raspberry Pi el procesamiento correrá
+más lento que tiempo real, y medir con el reloj de pared subestimaría todas las velocidades por
+el cociente entre ambas tasas. Es un error silencioso — los números salen plausibles,
+simplemente están mal.
+
+**B. La distancia acumulada no es el estimador principal — y es contraintuitivo.** La forma
+natural de estimar velocidad es sumar las distancias entre puntos consecutivos y dividir entre
+el tiempo. **Está sesgada hacia arriba, y el sesgo crece con el ruido.** La longitud de arco es
+una suma de magnitudes siempre positivas: cada perturbación aleatoria del punto de contacto
+*agrega* recorrido, nunca lo quita. Un vehículo perfectamente quieto con ruido de medición
+acumula distancia y aparenta moverse. El estimador correcto (`window`, el default) ajusta
+**posición contra tiempo** por mínimos cuadrados sobre una ventana deslizante: las pendientes de
+`x(t)` e `y(t)` forman el vector velocidad, y el ruido de media cero se cancela en el ajuste en
+vez de acumularse. El banco sintético (`--self-test`) lo demuestra numéricamente: con el mismo
+ruido, el estimador de ventana se mantiene centrado en cero mientras el acumulado se dispara
+(ver `estimator_bias.png`).
+
+### Por qué el suavizado va en metros y no en píxeles
+
+Una ventana de suavizado uniforme en píxeles equivale a una ventana que en metros vale mucho más
+en la zona lejana de la escena que en la cercana — el mismo desplazamiento de un píxel
+representa centímetros cerca de la cámara y puede representar decímetros lejos. Suavizar ya en
+el espacio métrico aplica el mismo criterio físico (una distancia fija en metros) en toda la
+escena. Si el seguimiento ya suavizó en píxeles (`tracking.smoothing_window` > 1), configurá ese
+valor en `0` al regenerar las trayectorias para no encadenar dos suavizados con dos criterios
+distintos.
+
+### El banco de pruebas sintético
+
+La calibración real de un sitio puede tardar en estar lista (o directamente no existir todavía).
+`--self-test` no depende de ella en absoluto: construye su propia homografía a partir de
+parámetros explícitos de cámara (altura, inclinación, distancia focal) y genera trayectorias con
+velocidad **exactamente conocida**, en dos geometrías representativas:
+
+- **Longitudinal** — la cámara mira a lo largo de la vía. Escala muy desigual (el mismo píxel de
+  ruido vale centímetros cerca y metros lejos), mala resolución en profundidad.
+- **Transversal** — la cámara mira perpendicular a la vía. Escala pareja, buena resolución.
+
+Esta separación permite responder por separado dos preguntas que con datos reales quedan
+confundidas: cuánto error introduce el **estimador** en sí, y cuánto introducen la
+**calibración** y el **seguimiento**. Las trayectorias sintéticas tienen exactamente la misma
+forma que las reales, así que el estimador las procesa con el mismo código, sin ninguna ruta
+especial de "modo prueba".
+
+El barrido agrega con la **mediana**, no el promedio: cerca del punto de fuga de una cámara con
+inclinación baja, la escala metros/píxel crece sin cota, y unas pocas repeticiones con error
+enorme (legítimas, no un bug) dominarían un promedio y taparían el comportamiento típico.
+
+### Guía de interpretación: sesgo contra dispersión (validación)
+
+Es la lectura central de `--validate`, y va también en el informe:
+
+> El **sesgo** y la **dispersión** señalan causas distintas y se corrigen distinto.
+>
+> Sesgo grande con dispersión pequeña —todos los valores desviados en proporción similar—
+> indica un **error de escala en la calibración**. Es sistemático y se corrige revisando las
+> coordenadas del mundo, no tocando el estimador ni el seguimiento.
+>
+> Sesgo cercano a cero con dispersión grande indica **ruido de detección y seguimiento**. Se
+> ataca con ventana de ajuste más larga, más suavizado, o restringiendo la zona de medición a
+> donde la escala es favorable.
+>
+> Ambos grandes: revisar primero la calibración, porque el sesgo puede estar enmascarando el
+> diagnóstico de la dispersión.
+
+### Formato del CSV de referencia (`config/speed_reference_example.csv`)
+
+```csv
+video,track_id,speed_ref_kmh,method,baseline_m,frame_in,frame_out,notes
+sitio_a_01.mp4,7,42.3,manual_baseline,22.4,318,375,"sedán gris"
+```
+
+`method` distingue procedencias (`manual_baseline`, `gps`, `radar`) para poder analizarlas por
+separado. Un emparejamiento bajo entre referencia y estimaciones **es en sí un hallazgo**:
+significa que el seguimiento perdió vehículos que el ojo humano sí identificó.
+
+### Tabla de argumentos de `scripts/estimate_speed.py`
+
+| Argumento | Default | Descripción |
+|---|---|---|
+| `--tracks` | auto | Archivo de trayectorias. Default: el más reciente de `results/tracks/`. |
+| `--calibration` | del config | Ruta a `calibration.json`. |
+| `--estimator` | `window` | `window`, `endpoint` o `cumulative`. |
+| `--window` | del config | Ancho de la ventana, en segundos. |
+| `--output` | auto | Prefijo de los archivos de salida. |
+| `--validate` | None | CSV de referencia; activa el módulo de validación. |
+| `--self-test` | False | Corre el banco sintético. **No requiere calibración.** |
+| `--all-estimators` | False | Calcula los tres y genera la comparación. |
+| `--min-speed` | del config | Velocidad mínima para considerar el track en movimiento. |
+| `--force` | False | Continúa aunque la calidad de la calibración esté bajo el umbral (la advertencia queda igual en la salida escrita). |
+
+### Limitaciones declaradas
+
+- El punto de contacto es una **aproximación** de dónde tocan las llantas, y se desplaza según
+  el ángulo de visión del vehículo (más notorio en vehículos altos o vistos de perfil cerrado).
+- La homografía **solo es válida sobre el plano de la calzada** — nada fuera de ese plano.
+- La precisión se degrada con la distancia a la cámara, por el gradiente de escala.
+- La geometría de la instalación (altura, ángulo, orientación respecto a la vía) impone un piso
+  de error que ningún ajuste de software puede bajar — el banco sintético lo cuantifica.
+
+### Ejemplos de uso
+
+```bash
+# Validar el estimador sin calibración
+python scripts/estimate_speed.py --self-test
+
+# Estimar sobre trayectorias reales
+python scripts/estimate_speed.py --tracks results/tracks/yolov8n_bytetrack_sitio_a_01.json
+
+# Comparar los tres estimadores
+python scripts/estimate_speed.py --all-estimators
+
+# Validar contra mediciones manuales
+python scripts/estimate_speed.py --validate config/speed_reference.csv
+```
+
+### Vista previa en vivo
+
+`scripts/estimate_speed.py` es el análisis riguroso (filtra, usa la trayectoria completa, genera el
+informe). Para una inspección visual rápida, `preview_detection.py --track` puede mostrar un `km/h`
+aproximado junto a cada ID:
+
+```bash
+python scripts/preview_detection.py --track --speed
+python scripts/preview_detection.py --track --speed --calibration config/otra_calibracion.json
+```
+
+Requiere `--track` (la velocidad se calcula sobre la trayectoria de un ID persistente) y una
+calibración ya hecha con `scripts/calibrate.py`. Si la resolución del video no coincide con la de
+la calibración, falla con un error claro en vez de mostrar números con escala equivocada. Tecla
+`v` la muestra/oculta en vivo.
+
+**Es una lectura aproximada, no la cifra del informe:** usa `SpeedEstimator.estimate_instantaneous()`,
+que ajusta sobre una ventana hacia **atrás** (no centrada — en vivo no hay observaciones futuras) y
+**no aplica el filtrado** de zona calibrada/escala/saltos imposibles. El número de un track recién
+aparecido puede tardar una fracción de segundo en estabilizarse mientras se acumulan las primeras
+observaciones. Para el número que va al informe, siempre `scripts/estimate_speed.py`.
+
+### Guía de diagnóstico sobre datos reales
+
+| Patrón | Qué revisar |
+|---|---|
+| Muchos tracks descartados por "fuera de zona calibrada" | El casco convexo de los puntos de calibración no cubre la vía — marcá más puntos, mejor repartidos. |
+| Velocidades sistemáticamente altas o bajas | Error de escala en la calibración — no es un problema del estimador. |
+| Dispersión alta con sesgo nulo | Ruido de seguimiento — probá más suavizado o una ventana más ancha. |
+| Perfiles de velocidad con picos aislados | Cambios de identidad (ID switch) o suavizado insuficiente. |
+| `r_squared` bajo de forma generalizada | Calibración mala, o vehículos que realmente aceleran/frenan/giran (no es necesariamente un error). |
 
 ## Notas para hardware embebido
 

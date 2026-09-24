@@ -100,3 +100,64 @@ tracking:
     show_trails: true
     show_lost_trails: true          # Estelas grises de tracks recién perdidos
     id_font_scale: 0.6
+    show_speed: true                 # Overlay de velocidad en vivo (solo con --speed y calibración cargada)
+
+calibration:
+  file: "config/calibration.json"
+  points_csv: "config/points.csv"
+  output_dir: "results/calibration/"
+
+  fit_method: "least_squares"    # "least_squares" | "ransac"
+  ransac_threshold_m: 0.5        # En METROS: el umbral se aplica en el espacio de destino
+
+  thresholds:
+    reprojection_ok_m: 0.15      # Bajo esto, calibración aceptable
+    reprojection_warn_m: 0.30    # Sobre esto, no continuar a velocidad
+    loo_ok_m: 0.30
+    loo_warn_m: 0.60
+    min_hull_ratio: 0.05         # Cobertura mínima del casco convexo
+    max_scale_cm_per_px: 30.0    # Sobre esto, la zona no sirve para medir
+
+  aerial:
+    enabled: true                # false = siempre modo manual
+    provider: "maptiler"
+    api_key_env: "MAPTILER_KEY"  # Nombre de la variable de entorno; NUNCA la llave misma
+    cache_dir: "data/aerial/"
+    default_zoom: 20
+    size: [1024, 1024]
+    warn_m_per_px: 0.20
+
+  birdseye:
+    px_per_meter: 20
+    margin_m: 5
+
+speed:
+  estimator: "window"              # "window" | "endpoint" | "cumulative"
+  window_s: 0.7                    # Ancho de la ventana de ajuste, en segundos
+  min_window_points: 5             # Mínimo de puntos por ventana
+  smoothing_window_metric: 5       # Suavizado en metros (impar, 0 = desactivado)
+  skip_pixel_smoothing: true       # Evita suavizar dos veces si el seguimiento ya lo hizo
+
+  filters:
+    min_observations: 15           # Observaciones mínimas tras filtrar
+    min_distance_m: 5.0            # Recorrido mínimo para estimar
+    min_speed_kmh: 3.0             # Debajo de esto se considera detenido
+    max_plausible_kmh: 150.0       # Encima de esto, salto imposible → probable cambio de ID
+    max_scale_cm_per_px: 15.0      # Descarta observaciones donde la escala se degrada
+    hull_margin_m: 2.0             # Margen permitido fuera de la zona calibrada
+    min_r_squared: 0.85            # Ajuste mínimo aceptable
+
+  validation:
+    reference_csv: "config/speed_reference.csv"
+    output_dir: "results/speed/validation/"
+
+  synthetic:
+    output_dir: "results/speed/synthetic/"
+    repetitions: 30                # Repeticiones por combinación
+    seed: 42                       # Semilla base, para reproducibilidad
+    speeds_kmh: [20, 30, 40, 50, 60, 80]
+    noise_px: [0, 1, 2, 4, 8]
+    fps: 30.0
+    duration_s: 3.0
+
+  output_dir: "results/speed/"

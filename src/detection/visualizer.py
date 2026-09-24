@@ -26,6 +26,7 @@ import numpy as np
 from tqdm import tqdm
 
 from src.detection.detector import VehicleDetector
+from src.speed.estimator import SpeedEstimator
 from src.tracking.tracker import VehicleTracker
 from src.utils.roi import ROIFilter, load_roi
 
@@ -89,6 +90,7 @@ class DetectionVisualizer:
     def __init__(
         self, config: Dict[str, Any], detector: VehicleDetector, video_path: str,
         roi_filter: Optional[ROIFilter] = None, tracker: Optional[VehicleTracker] = None,
+        plane: Optional[Any] = None,
     ) -> None:
         """
         Abre el video y prepara el estado interno del visualizador.
@@ -110,6 +112,14 @@ class DetectionVisualizer:
                 para obtener las detecciones (con la clave adicional
                 `"track_id"`), y activa el modo de visualización de
                 seguimiento (color por ID, estelas, HUD extendido).
+            plane (CalibratedPlane | None): si se pasa (junto con `tracker`),
+                habilita el overlay de velocidad en vivo — un `km/h`
+                aproximado junto al ID de cada vehículo, calculado con
+                `SpeedEstimator.estimate_instantaneous()` sobre las
+                observaciones acumuladas de su track hasta el frame actual.
+                Es una lectura rápida para inspección visual, no reemplaza
+                `scripts/estimate_speed.py` (que filtra y usa la trayectoria
+                completa) para el número que va al informe.
 
         Retorna:
             None
@@ -183,6 +193,10 @@ class DetectionVisualizer:
         self.show_trails = bool(viz_cfg.get("show_trails", True))
         self.show_lost_trails = bool(viz_cfg.get("show_lost_trails", True))
         self.id_font_scale = float(viz_cfg.get("id_font_scale", 0.6))
+        self.show_speed = bool(viz_cfg.get("show_speed", True))
+
+        self.plane = plane
+        self.speed_estimator = SpeedEstimator(config, plane=plane) if plane is not None else None
         # Estado de estelas del tracker principal (self.tracker). El modo de
         # comparación de trackers (run_compare con tracker_b) usa diccionarios
         # locales propios en vez de estos, para no mezclar los IDs de dos
@@ -814,7 +828,14 @@ class DetectionVisualizer:
                 track = tracker.tracks.get(track_id)
                 age = track.length_frames() if track is not None else 1
                 age_suffix = f' ({age}f)' if age > self.min_track_frames else ''
-                label = f'#{track_id} {det["class_name"]} {det["confidence"]:.2f}{age_suffix}'
+
+                speed_suffix = ''
+                if self.speed_estimator is not None and self.show_speed and track is not None:
+                    speed_kmh = self.speed_estimator.estimate_instantaneous(track.observations)
+                    if speed_kmh is not None:
+                        speed_suffix = f' {speed_kmh:.0f}km/h'
+
+                label = f'#{track_id} {det["class_name"]} {det["confidence"]:.2f}{speed_suffix}{age_suffix}'
                 thickness = 2  # "negrita visual": OpenCV no tiene bold real, se aproxima con más grosor
             else:
                 label = f'{det["class_name"]} {det["confidence"]:.2f}'
@@ -1082,7 +1103,8 @@ class DetectionVisualizer:
         color por ID, estelas y HUD extendido.
 
         Controles adicionales sobre el modo de solo detección: `t` (estelas),
-        `i` (IDs), `c` (color por ID/clase), `[`/`]` (acortar/alargar estela).
+        `i` (IDs), `c` (color por ID/clase), `[`/`]` (acortar/alargar estela),
+        `v` (mostrar/ocultar velocidad, solo si se pasó `plane` al construir).
 
         Retorna:
             None
@@ -1169,6 +1191,8 @@ class DetectionVisualizer:
                     show_ids = not show_ids
                 elif key_low == ord('c'):
                     color_by_id = not color_by_id
+                elif key_low == ord('v') and self.speed_estimator is not None:
+                    self.show_speed = not self.show_speed
                 elif key_low == ord('['):
                     self.trail_length = max(5, self.trail_length - 10)
                     self._resize_trail_buffers()

@@ -1,0 +1,26 @@
+# Mediciones de referencia para scripts/estimate_speed.py --validate <este_archivo>
+#
+# Columnas: video,track_id,speed_ref_kmh,method,baseline_m,frame_in,frame_out,notes
+#   video         : nombre del archivo de video (solo el nombre, no la ruta completa;
+#                   se compara contra el `source_video` guardado en el JSON de trayectorias).
+#   track_id      : el mismo ID que le asignó el seguimiento a ese vehículo
+#                   (mirá el video anotado o `results/tracks/*.json` para identificarlo).
+#   speed_ref_kmh : la velocidad de referencia, medida independientemente del sistema.
+#   method        : de dónde salió la referencia — "manual_baseline" (cinta + cronómetro
+#                   entre dos marcas), "gps" (GPS de un vehículo de prueba) o "radar".
+#                   Permite analizar cada procedencia por separado si hace falta.
+#   baseline_m    : para method=manual_baseline, la distancia entre las dos marcas usadas
+#                   para cronometrar. Opcional para los demás métodos.
+#   frame_in      : frame en que el vehículo cruza la primera marca. Opcional.
+#   frame_out     : frame en que el vehículo cruza la segunda marca. Opcional.
+#   notes         : descripción corta del vehículo, para poder ubicarlo a simple vista
+#                   (ej. "sedán gris", "motocicleta roja").
+#
+# Las líneas que empiezan con "#" y las líneas vacías se ignoran.
+#
+# Ejemplo (borrá estas filas y reemplazalas por tus propias mediciones):
+# video,track_id,speed_ref_kmh,method,baseline_m,frame_in,frame_out,notes
+# sitio_a_01.mp4,7,42.3,manual_baseline,22.4,318,375,"sedán gris"
+# sitio_a_01.mp4,12,35.1,manual_baseline,22.4,410,452,"motocicleta roja"
+# sitio_a_01.mp4,19,58.0,gps,,,,"pickup blanca, referencia por GPS del propio vehículo"
+video,track_id,speed_ref_kmh,method,baseline_m,frame_in,frame_out,notes

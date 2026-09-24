@@ -37,6 +37,24 @@ config/roi_reference.png
 config/roi.backup_*.json
 results/roi.log
 
+# Calibración por homografía: específica del sitio/video local, y sus reportes.
+# config/points.csv NO se ignora: es el formato reproducible que sí se versiona.
+config/calibration.json
+config/calibration.backup_*.json
+results/calibration/**
+results/calibration.log
+data/aerial/
+
+# Trayectorias de seguimiento (específicas del video/corrida) y su log.
+# (Faltaba en el .gitignore desde la fase de seguimiento; se agrega acá.)
+results/tracks/**
+results/tracking.log
+
+# Resultados de la estimación de velocidad (CSV/JSON/gráficas por corrida,
+# banco sintético, validación) y su log.
+results/speed/**
+results/speed.log
+
 # Jupyter
 .ipynb_checkpoints/
 

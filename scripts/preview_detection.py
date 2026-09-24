@@ -21,8 +21,10 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.calibration.homography import CalibratedPlane
 from src.detection.detector import VehicleDetector
 from src.detection.visualizer import DetectionVisualizer
+from src.speed.estimator import SpeedEstimator
 from src.tracking.tracker import VehicleTracker
 
 logger = logging.getLogger(__name__)
@@ -147,6 +149,15 @@ def parse_args() -> argparse.Namespace:
         "--no-trail", action="store_true",
         help="Arranca con las estelas ocultas.",
     )
+    parser.add_argument(
+        "--speed", action="store_true",
+        help="Activa el overlay de velocidad en vivo (km/h junto al ID). Requiere --track y una "
+             "calibración ya hecha con scripts/calibrate.py.",
+    )
+    parser.add_argument(
+        "--calibration", type=str, default=None,
+        help="Ruta a calibration.json para --speed. Default: calibration.file del config.",
+    )
     return parser.parse_args()
 
 
@@ -242,7 +253,8 @@ def resolve_model(config: dict, model_id: "str | None", role: str) -> dict:
 
 
 def print_banner(video_path: str, visualizer: DetectionVisualizer, model_id: str,
-                  conf: float, device: str, mode_desc: str, tracking_active: bool = False) -> None:
+                  conf: float, device: str, mode_desc: str, tracking_active: bool = False,
+                  speed_active: bool = False) -> None:
     """
     Imprime el encabezado con la configuración efectiva antes de arrancar.
 
@@ -256,6 +268,8 @@ def print_banner(video_path: str, visualizer: DetectionVisualizer, model_id: str
         mode_desc (str): descripción del modo de ejecución elegido.
         tracking_active (bool): si es True, agrega la línea de controles
             propios del modo seguimiento (estelas, IDs, color).
+        speed_active (bool): si es True, agrega el control del overlay de
+            velocidad estimada (requiere `tracking_active`).
 
     Retorna:
         None
@@ -275,9 +289,10 @@ def print_banner(video_path: str, visualizer: DetectionVisualizer, model_id: str
     print("╚" + "═" * box_width + "╝")
 
     print("\nControles: [espacio] pausa · [n] siguiente frame · [s] captura")
-    print("           [b] cajas · [h] HUD · [+/-] velocidad · [r] reiniciar · [q] salir")
+    print("           [b] cajas · [h] HUD · [+/-] velocidad de reproducción · [r] reiniciar · [q] salir")
     if tracking_active:
-        print("           [t] estelas · [i] IDs · [c] color por ID/clase · [[/]] largo de estela\n")
+        extra = " · [v] velocidad estimada" if speed_active else ""
+        print(f"           [t] estelas · [i] IDs · [c] color por ID/clase · [[/]] largo de estela{extra}\n")
     else:
         print()
 
@@ -317,6 +332,9 @@ def main() -> None:
     if args.compare_tracker and not args.track:
         print("✗ --compare-tracker requiere --track.")
         sys.exit(1)
+    if args.speed and not args.track:
+        print("✗ --speed requiere --track (la velocidad se calcula sobre la trayectoria de un ID persistente).")
+        sys.exit(1)
 
     model_cfg = resolve_model(config, args.model, "principal")
     compare_cfg = resolve_model(config, args.compare, "de comparación") if args.compare else None
@@ -341,6 +359,27 @@ def main() -> None:
                 model_cfg["id"], model_cfg["weights"], tracker_name, config, visualizer.source_fps,
             )
             visualizer.tracker = tracker_obj
+
+            if args.speed:
+                calibration_path = args.calibration or config.get("calibration", {}).get("file", "config/calibration.json")
+                try:
+                    plane = CalibratedPlane.load(calibration_path)
+                except (FileNotFoundError, ValueError) as exc:
+                    print(f"✗ {exc}")
+                    sys.exit(1)
+
+                plane_w, plane_h = plane.frame_size
+                if (plane_w, plane_h) != (visualizer.width, visualizer.height):
+                    print(
+                        f"✗ La calibración '{calibration_path}' fue ajustada para "
+                        f"{plane_w}x{plane_h}, pero este video es {visualizer.width}x{visualizer.height}. "
+                        f"Usarla igual daría un error de escala sistemático. Recalibrá para esta resolución."
+                    )
+                    sys.exit(1)
+
+                logger.info("Calibración cargada para overlay de velocidad: %s", calibration_path)
+                visualizer.plane = plane
+                visualizer.speed_estimator = SpeedEstimator(config, plane=plane)
 
             if args.compare_tracker:
                 logger.info(
@@ -384,7 +423,8 @@ def main() -> None:
             "exportación a archivo" if want_export else "ventana interactiva"
         )
     elif args.track:
-        mode_desc = f"seguimiento ({tracker_obj.tracker_name}) — " + (
+        speed_suffix = " + velocidad" if args.speed else ""
+        mode_desc = f"seguimiento ({tracker_obj.tracker_name}{speed_suffix}) — " + (
             "exportación a archivo" if want_export else "ventana interactiva"
         )
     elif want_export:
@@ -395,7 +435,7 @@ def main() -> None:
     print_banner(
         video_path, visualizer, model_cfg["id"],
         config["detection"]["confidence_threshold"], config["benchmark"]["device"], mode_desc,
-        tracking_active=args.track,
+        tracking_active=args.track, speed_active=args.speed,
     )
 
     try:

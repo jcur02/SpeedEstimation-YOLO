@@ -1,0 +1,37 @@
+# Puntos de correspondencia para scripts/calibrate.py --points <este_archivo>
+#
+# Columnas: label,px,py,lat,lon,note
+#   label : identificador corto y único del punto (A, B, C, ...).
+#   px,py : posición del punto en píxeles, sobre el frame de referencia
+#           extraído del video (esquina superior izquierda = (0,0)).
+#   lat,lon: latitud y longitud del mismo punto en el mundo real, en grados
+#           decimales, con 6 o más decimales (clic derecho en Google Maps
+#           sobre el punto exacto). Menos de 5 decimales se rechaza: el
+#           error posicional ya supera el metro.
+#   note  : descripción corta del punto, opcional pero muy recomendada (ej.
+#           "esquina NE del cruce peatonal"). Dentro de seis meses, esa nota
+#           te dice si podés recalibrar; un par de números no.
+#
+# Requisitos:
+#   - Al menos 4 filas de datos (más allá de este encabezado y estos
+#     comentarios). Se recomiendan 6 u 8: con exactamente 4 no hay puntos
+#     sobrantes para la validación cruzada (leave-one-out).
+#   - Elegí marcas pintadas sobre el asfalto (esquinas de cruces peatonales,
+#     extremos de líneas discontinuas, bordes de flechas viales). Evitá
+#     bases de postes o esquinas de edificios: si comparás contra una imagen
+#     satelital, esos objetos altos aparecen con la base desplazada porque
+#     la imagen no está perfectamente ortorectificada.
+#   - Repartí los puntos por toda la zona de interés (cerca y lejos de la
+#     cámara, izquierda y derecha), nunca agrupados en una sola esquina.
+#
+# Las líneas que empiezan con "#" y las líneas vacías se ignoran.
+#
+# Ejemplo (borrá estas filas y reemplazalas por tus propios puntos):
+# label,px,py,lat,lon,note
+# A,820,410,9.8574123,-83.9112345,esquina NE del cruce peatonal
+# B,1100,415,9.8574087,-83.9111890,esquina NO del cruce peatonal
+# C,1050,610,9.8573602,-83.9111975,extremo lejano de la línea discontinua central
+# D,860,600,9.8573615,-83.9112410,extremo lejano del borde izquierdo del carril
+# E,700,900,9.8574560,-83.9112720,esquina cercana del cruce peatonal (izq.)
+# F,1250,905,9.8574530,-83.9111610,esquina cercana del cruce peatonal (der.)
+label,px,py,lat,lon,note
