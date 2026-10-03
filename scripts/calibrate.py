@@ -8,16 +8,21 @@ transformación de píxeles a metros. Una calibración silenciosamente mala
 produce velocidades que parecen razonables pero están sistemáticamente
 equivocadas.
 
-Tres formas de obtener los puntos de correspondencia:
-    A) Con imagen aérea (si hay MAPTILER_KEY configurada): marcado por pares
-       cámara <-> aérea, con error de reproyección en vivo.
-    B) Manual: clic sobre la cámara, lat/lon tecleada en consola.
-    C) Desde un CSV versionado y reproducible (`--points`).
+Dos formas de obtener los puntos de correspondencia:
+    A) Selector gráfico (Tkinter): clic sobre el frame de la cámara,
+       coordenadas pegadas o tecleadas en un campo de texto (formato de
+       Google Maps). Si hay una imagen aérea disponible (`--fetch-aerial` o
+       ya cacheada), agrega una pestaña donde un clic calcula la lat/lon
+       automáticamente. Con `--points`, arranca con esos puntos ya
+       cargados, listos para editar.
+    B) Desde un CSV versionado y reproducible, sin interfaz gráfica
+       (`--points archivo.csv --no-gui`).
 
 Uso:
     python scripts/calibrate.py --fetch-aerial --center 9.8574,-83.9112
     python scripts/calibrate.py
     python scripts/calibrate.py --points config/points.csv
+    python scripts/calibrate.py --points config/points.csv --no-gui
     python scripts/calibrate.py --verify
     python scripts/calibrate.py --show
 """
@@ -43,10 +48,17 @@ from src.calibration.homography import CalibratedPlane, HomographyCalibration
 from src.calibration.report import render_birdseye, render_residuals, render_scale_map
 from src.utils.roi import md5_of_frame
 
+try:
+    import tkinter  # noqa: F401  (solo para verificar disponibilidad antes de usar el selector)
+    from src.calibration.picker import CalibrationPicker
+    _TKINTER_AVAILABLE = True
+except ImportError:
+    CalibrationPicker = None  # type: ignore[assignment,misc]
+    _TKINTER_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
-_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _STATUS_RANK = {"ok": 0, "warn": 1, "reject": 2}
 
 
@@ -87,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video", type=str, default=None, help="Video del que se toma el frame de referencia. Default: primer .mp4 en data/videos/.")
     parser.add_argument("--frame-sec", type=float, default=None, help="Segundo del frame de referencia. Default: el frame medio del video.")
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Ruta al archivo de configuración (default: config/config.yaml).")
-    parser.add_argument("--points", type=str, default=None, help="CSV de puntos ya preparado; salta el marcado interactivo.")
+    parser.add_argument("--points", type=str, default=None, help="CSV de puntos ya preparado. Sin --no-gui, abre el selector con esos puntos cargados para editarlos; con --no-gui, los usa directamente sin abrir ventana.")
     parser.add_argument("--aerial", type=str, default=None, help="Imagen aérea ya descargada (con su .meta.json).")
     parser.add_argument("--fetch-aerial", action="store_true", help="Descarga la imagen aérea vía MapTiler.")
     parser.add_argument("--center", type=str, default=None, help="lat,lon del centro para la descarga aérea.")
@@ -96,6 +108,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default=None, help="Dónde guardar el JSON. Default: calibration.file del config.")
     parser.add_argument("--verify", action="store_true", help="Modo verificación sobre una calibración existente.")
     parser.add_argument("--show", action="store_true", help="Muestra la calibración guardada y sus reportes.")
+    parser.add_argument(
+        "--no-gui", action="store_true",
+        help="Fuerza el modo sin interfaz gráfica: requiere --points, no abre ninguna ventana.",
+    )
     return parser.parse_args()
 
 
@@ -187,7 +203,7 @@ def get_reference_frame(video_path: str, frame_sec: Optional[float]) -> Tuple[np
 
 
 # ----------------------------------------------------------------------
-# Modo C: CSV
+# Carga de puntos desde CSV (modo sin interfaz gráfica, o precarga del selector)
 # ----------------------------------------------------------------------
 
 def load_points_csv(path: str) -> List[Dict[str, Any]]:
@@ -259,283 +275,6 @@ def load_points_csv(path: str) -> List[Dict[str, Any]]:
         sys.exit(1)
 
     return points
-
-
-# ----------------------------------------------------------------------
-# Modo B: manual, sin imagen aérea
-# ----------------------------------------------------------------------
-
-def run_manual_mode(frame: np.ndarray, width: int, height: int) -> List[Dict[str, Any]]:
-    """
-    Marcado manual: clic sobre el frame de la cámara, luego la consola pide
-    latitud y longitud de ese punto, validadas con `LocalENU.validate_precision`.
-
-    Controles: `z` deshace el último punto, Enter confirma (mínimo 4
-    puntos), `q`/ESC sale pidiendo confirmación.
-
-    Parámetros:
-        frame (numpy.ndarray): frame de la cámara sobre el que marcar.
-        width, height (int): dimensiones del frame.
-
-    Retorna:
-        list[dict]: puntos con `label`, `pixel`, `latlon`, `note`.
-    """
-    points: List[Dict[str, Any]] = []
-    pending_click: List[Optional[Tuple[int, int]]] = [None]
-
-    def on_mouse(event: int, x: int, y: int, flags: int, userdata: Any) -> None:
-        if event == cv2.EVENT_LBUTTONDOWN:
-            pending_click[0] = (x, y)
-
-    window_name = "Marcar puntos de calibracion (clic sobre el asfalto)"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(window_name, on_mouse)
-
-    print("\nModo manual: hacé clic sobre un punto de referencia en la imagen; luego se te pedirá")
-    print("su latitud y longitud en la consola.")
-    print("[z] deshacer el último punto   [Enter] terminar (mínimo 4 puntos)   [q/ESC] salir\n")
-
-    try:
-        while True:
-            disp = frame.copy()
-            for p in points:
-                x, y = p["pixel"]
-                cv2.circle(disp, (int(x), int(y)), 6, (0, 140, 255), -1)
-                cv2.putText(disp, p["label"], (int(x) + 8, int(y) - 8), _FONT, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(disp, f"Puntos: {len(points)}", (10, 30), _FONT, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.imshow(window_name, disp)
-            key = cv2.waitKey(20) & 0xFF
-
-            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-                print("Ventana cerrada sin guardar.")
-                sys.exit(0)
-
-            if key in (ord('q'), 27):
-                answer = input("\n¿Salir sin guardar? [s/N]: ").strip().lower()
-                if answer in ("s", "si", "sí", "y", "yes"):
-                    sys.exit(0)
-                continue
-            if key == ord('z'):
-                if points:
-                    removed = points.pop()
-                    print(f"  Deshecho: punto {removed['label']}.")
-                continue
-            if key in (13, 10):
-                if len(points) < 4:
-                    print("  Necesitás al menos 4 puntos para confirmar.")
-                    continue
-                break
-
-            if pending_click[0] is not None:
-                x, y = pending_click[0]
-                pending_click[0] = None
-                label = _LABELS[len(points)]
-                print(f"\nPunto {label} marcado en píxel ({x}, {y}).")
-                while True:
-                    lat_str = input(f"  Latitud de {label}: ").strip()
-                    lon_str = input(f"  Longitud de {label}: ").strip()
-                    ok, msg = LocalENU.validate_precision(lat_str, lon_str)
-                    print(f"  {msg}")
-                    if ok:
-                        break
-                note = input(f"  Nota descriptiva para {label} (opcional, Enter para omitir): ").strip()
-                points.append({
-                    "label": label, "pixel": [float(x), float(y)],
-                    "latlon": [float(lat_str), float(lon_str)], "note": note,
-                })
-    finally:
-        cv2.destroyWindow(window_name)
-
-    return points
-
-
-# ----------------------------------------------------------------------
-# Modo A: marcado con imagen aérea
-# ----------------------------------------------------------------------
-
-def _draw_magnifier(
-    canvas: np.ndarray, mouse_pos: List[Any], cam_w: int, cam_scale: float, aer_scale: float,
-    frame: np.ndarray, aerial_img: np.ndarray, zoom: int = 4, size: int = 140,
-) -> None:
-    """
-    Dibuja una lupa con la zona bajo el cursor, ampliada, en la esquina
-    superior derecha del canvas. Sin esto, la precisión del clic domina el
-    error total de la calibración.
-    """
-    x_disp, y_disp, side = mouse_pos
-    if side == "cam":
-        src, sx, sy = frame, x_disp / cam_scale, y_disp / cam_scale
-    else:
-        src, sx, sy = aerial_img, (x_disp - cam_w) / aer_scale, y_disp / aer_scale
-
-    half = max(size // (2 * zoom), 4)
-    x0, y0 = int(sx - half), int(sy - half)
-    x1, y1 = x0 + 2 * half, y0 + 2 * half
-    h, w = src.shape[:2]
-    x0c, y0c, x1c, y1c = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
-    if x1c <= x0c or y1c <= y0c:
-        return
-
-    crop = src[y0c:y1c, x0c:x1c]
-    mag = cv2.resize(crop, (size, size), interpolation=cv2.INTER_NEAREST)
-    cv2.line(mag, (size // 2 - 8, size // 2), (size // 2 + 8, size // 2), (0, 255, 0), 1)
-    cv2.line(mag, (size // 2, size // 2 - 8), (size // 2, size // 2 + 8), (0, 255, 0), 1)
-    cv2.rectangle(mag, (0, 0), (size - 1, size - 1), (255, 255, 255), 1)
-
-    px, py = canvas.shape[1] - size - 10, 10
-    canvas[py:py + size, px:px + size] = mag
-
-
-def run_aerial_mode(
-    frame: np.ndarray, aerial: AerialImage, width: int, height: int,
-) -> List[Dict[str, Any]]:
-    """
-    Marcado por pares: ventana única con la cámara a la izquierda y la
-    imagen aérea a la derecha. Los clics se alternan por pares (cámara,
-    luego aérea); cada par forma un punto de correspondencia.
-
-    Desde el quinto par, recalcula y muestra en pantalla el error de
-    reproyección medio actual, resaltando en rojo el par de peor residuo:
-    si se marcó mal una esquina, se ve en el momento, no media hora después.
-
-    Controles: `z` deshace, `n` anota el último par, Enter termina (mínimo
-    4 pares), `q`/ESC sale pidiendo confirmación.
-
-    Parámetros:
-        frame (numpy.ndarray): frame de la cámara.
-        aerial (AerialImage): imagen aérea georreferenciada.
-        width, height (int): dimensiones del frame de la cámara.
-
-    Retorna:
-        list[dict]: puntos con `label`, `pixel`, `latlon`, `note`.
-    """
-    aerial_img = cv2.imread(aerial.image_path)
-    if aerial_img is None:
-        print(f"✗ No se pudo leer la imagen aérea: '{aerial.image_path}'")
-        sys.exit(1)
-
-    panel_h = min(height, aerial_img.shape[0], 900)
-    cam_scale = panel_h / height
-    aer_scale = panel_h / aerial_img.shape[0]
-    cam_w = int(width * cam_scale)
-    aer_w = int(aerial_img.shape[1] * aer_scale)
-
-    cam_disp_base = cv2.resize(frame, (cam_w, panel_h))
-    aer_disp_base = cv2.resize(aerial_img, (aer_w, panel_h))
-
-    pairs: List[Dict[str, Any]] = []
-    pending_cam: Optional[Tuple[float, float]] = None
-    click_event: List[Optional[Tuple[str, int, int]]] = [None]
-    mouse_pos: List[Any] = [0, 0, "cam"]
-    calib_preview: Optional[Tuple[float, int]] = None
-
-    def on_mouse(event: int, x: int, y: int, flags: int, userdata: Any) -> None:
-        side = "cam" if x < cam_w else "aer"
-        mouse_pos[0], mouse_pos[1], mouse_pos[2] = x, y, side
-        if event == cv2.EVENT_LBUTTONDOWN:
-            click_event[0] = (side, x if side == "cam" else x - cam_w, y)
-
-    window_name = "Calibracion: camara (izq.) | imagen aerea (der.)"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(window_name, on_mouse)
-
-    print("\nModo aéreo: hacé clic alternando cámara -> aérea para formar cada par de puntos.")
-    print("[z] deshacer   [n] anotar el último par   [Enter] terminar (mínimo 4 pares)   [q/ESC] salir\n")
-
-    try:
-        while True:
-            canvas = np.zeros((panel_h, cam_w + aer_w, 3), dtype=np.uint8)
-            canvas[:, :cam_w] = cam_disp_base
-            canvas[:, cam_w:] = aer_disp_base
-            cv2.line(canvas, (cam_w, 0), (cam_w, panel_h), (255, 255, 255), 1)
-
-            worst_idx = calib_preview[1] if calib_preview else None
-            for i, pair in enumerate(pairs):
-                color = (0, 0, 255) if i == worst_idx else (0, 140, 255)
-                cx, cy = pair["cam_px"]
-                ax, ay = pair["aer_px"]
-                cv2.circle(canvas, (int(cx * cam_scale), int(cy * cam_scale)), 6, color, -1)
-                cv2.putText(canvas, pair["label"], (int(cx * cam_scale) + 8, int(cy * cam_scale) - 8), _FONT, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-                cv2.circle(canvas, (cam_w + int(ax * aer_scale), int(ay * aer_scale)), 6, color, -1)
-                cv2.putText(canvas, pair["label"], (cam_w + int(ax * aer_scale) + 8, int(ay * aer_scale) - 8), _FONT, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-
-            if pending_cam is not None:
-                cx, cy = pending_cam
-                cv2.circle(canvas, (int(cx * cam_scale), int(cy * cam_scale)), 6, (0, 255, 255), -1)
-
-            status = f"Pares: {len(pairs)}   Siguiente clic: {'AEREA' if pending_cam is not None else 'CAMARA'}"
-            cv2.putText(canvas, status, (10, 25), _FONT, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-            if calib_preview:
-                cv2.putText(canvas, f"Error medio actual: {calib_preview[0]:.2f} m", (10, 50), _FONT, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-
-            _draw_magnifier(canvas, mouse_pos, cam_w, cam_scale, aer_scale, frame, aerial_img)
-
-            cv2.imshow(window_name, canvas)
-            key = cv2.waitKey(20) & 0xFF
-
-            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-                print("Ventana cerrada sin guardar.")
-                sys.exit(0)
-            if key in (ord('q'), 27):
-                answer = input("\n¿Salir sin guardar? [s/N]: ").strip().lower()
-                if answer in ("s", "si", "sí", "y", "yes"):
-                    sys.exit(0)
-                continue
-            if key == ord('z'):
-                if pending_cam is not None:
-                    pending_cam = None
-                elif pairs:
-                    removed = pairs.pop()
-                    print(f"  Deshecho: par {removed['label']}.")
-                    calib_preview = None
-                continue
-            if key == ord('n') and pairs:
-                note = input(f"  Nota para el punto {pairs[-1]['label']}: ").strip()
-                pairs[-1]["note"] = note
-                continue
-            if key in (13, 10):
-                if len(pairs) < 4:
-                    print("  Necesitás al menos 4 pares para confirmar.")
-                    continue
-                break
-
-            if click_event[0] is not None:
-                side, x_disp, y_disp = click_event[0]
-                click_event[0] = None
-
-                if side == "cam":
-                    pending_cam = (x_disp / cam_scale, y_disp / cam_scale)
-                elif side == "aer" and pending_cam is not None:
-                    aer_px = (x_disp / aer_scale, y_disp / aer_scale)
-                    lat, lon = aerial.pixel_to_latlon(*aer_px)
-                    label = _LABELS[len(pairs)]
-                    pairs.append({
-                        "label": label, "cam_px": pending_cam, "aer_px": aer_px,
-                        "latlon": [lat, lon], "note": "",
-                    })
-                    print(f"  Par {label}: cámara({pending_cam[0]:.0f},{pending_cam[1]:.0f}) -> "
-                          f"lat/lon ({lat:.7f}, {lon:.7f})")
-                    pending_cam = None
-
-                    if len(pairs) >= 5:
-                        try:
-                            origin_lat, origin_lon = pairs[0]["latlon"]
-                            enu = LocalENU(origin_lat, origin_lon)
-                            trial_world = [enu.to_meters(*p["latlon"]) for p in pairs]
-                            trial_px = [p["cam_px"] for p in pairs]
-                            trial_calib = HomographyCalibration(trial_px, trial_world, (width, height))
-                            trial_calib.fit(method="least_squares")
-                            res = trial_calib.residuals()
-                            calib_preview = (float(np.mean(res)), int(np.argmax(res)))
-                        except ValueError:
-                            calib_preview = None
-    finally:
-        cv2.destroyWindow(window_name)
-
-    return [
-        {"label": p["label"], "pixel": [p["cam_px"][0], p["cam_px"][1]], "latlon": p["latlon"], "note": p.get("note", "")}
-        for p in pairs
-    ]
 
 
 # ----------------------------------------------------------------------
@@ -967,8 +706,8 @@ def _resolve_aerial(args: argparse.Namespace, calib_cfg: dict) -> Optional[Aeria
 def main() -> None:
     """
     Punto de entrada principal: despacha a `--show`/`--verify`, o resuelve
-    video, imagen aérea y puntos (CSV, aéreo o manual) y corre el flujo
-    común de calibración.
+    video, imagen aérea y puntos (selector gráfico o CSV sin interfaz) y
+    corre el flujo común de calibración.
 
     Retorna:
         None
@@ -987,6 +726,10 @@ def main() -> None:
         run_verify_mode(args, config, output_path)
         return
 
+    if args.no_gui and not args.points:
+        print("✗ --no-gui requiere --points archivo.csv: sin interfaz gráfica no hay otra forma de obtener los puntos.")
+        sys.exit(1)
+
     video_path = args.video or find_video(config["paths"]["videos"])
     if not video_path:
         print(f"✗ No se encontró ningún video en {config['paths']['videos']}. Indicá --video.")
@@ -995,33 +738,39 @@ def main() -> None:
     frame, frame_size = get_reference_frame(video_path, args.frame_sec)
     print(f"Video: {video_path}  ({frame_size[0]}x{frame_size[1]})")
 
-    aerial_obj = None if args.points else _resolve_aerial(args, calib_cfg)
-    points_mode = "csv" if args.points else ("aerial" if aerial_obj is not None else "manual")
-
-    if points_mode != "csv" and _is_headless():
-        print(
-            "✗ No se detectó un display disponible. El marcado interactivo requiere una interfaz "
-            "gráfica; preparalo en un CSV y usá --points archivo.csv en su lugar."
-        )
-        sys.exit(1)
-
-    width, height = frame_size
-    if points_mode == "csv":
+    if args.no_gui:
         points = load_points_csv(args.points)
-    elif points_mode == "aerial":
-        points = run_aerial_mode(frame, aerial_obj, width, height)
+        aerial_meta = None
     else:
-        points = run_manual_mode(frame, width, height)
+        if not _TKINTER_AVAILABLE:
+            print("✗ Tkinter no está disponible en este entorno. En Linux instalalo con: sudo apt install python3-tk")
+            print("  Mientras tanto, podés preparar un CSV y usar --points archivo.csv --no-gui.")
+            sys.exit(1)
+        if _is_headless():
+            print(
+                "✗ No se detectó un display disponible. El selector gráfico requiere una interfaz "
+                "gráfica; preparalo en un CSV y usá --points archivo.csv --no-gui en su lugar."
+            )
+            sys.exit(1)
 
-    aerial_meta = None
-    if points_mode == "aerial":
-        aerial_meta = {
-            "source": calib_cfg.get("aerial", {}).get("provider", "maptiler"),
-            "image": aerial_obj.image_path,
-            "center": [aerial_obj.center_lat, aerial_obj.center_lon],
-            "zoom": aerial_obj.zoom,
-            "m_per_px": aerial_obj.meters_per_pixel(),
-        }
+        aerial_obj = _resolve_aerial(args, calib_cfg)
+        existing_points = load_points_csv(args.points) if args.points else None
+
+        picker = CalibrationPicker(frame, config, existing_points=existing_points, aerial=aerial_obj)
+        points = picker.run()
+        if points is None:
+            print("Selector cerrado sin guardar.")
+            sys.exit(0)
+
+        aerial_meta = None
+        if aerial_obj is not None:
+            aerial_meta = {
+                "source": calib_cfg.get("aerial", {}).get("provider", "maptiler"),
+                "image": aerial_obj.image_path,
+                "center": [aerial_obj.center_lat, aerial_obj.center_lon],
+                "zoom": aerial_obj.zoom,
+                "m_per_px": aerial_obj.meters_per_pixel(),
+            }
 
     run_common_pipeline(points, frame, frame_size, video_path, config, args, output_path, aerial_meta)
 

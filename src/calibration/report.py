@@ -148,11 +148,21 @@ def render_birdseye(
 
     world_min = np.maximum(corner_min, cal_min)
     world_max = np.minimum(corner_max, cal_max)
-    if np.any(world_max <= world_min):
-        # El horizonte se proyectó fuera de rango, o las esquinas del frame no
-        # llegan a cubrir la zona calibrada: usar directamente el entorno de
-        # los puntos de calibración en vez de un rango vacío/invertido.
-        world_min, world_max = cal_min, cal_max
+
+    # Con una homografía mal condicionada (puntos casi colineales), las
+    # esquinas del frame pueden proyectarse a coordenadas de mundo
+    # disparatadas, y la intersección de arriba puede colapsar a una rendija
+    # angosta en algún eje aunque no llegue a invertirse. Esa rendija no
+    # refleja nada real del encuadre: es ruido numérico de la extrapolación.
+    # Si algún eje de la intersección queda por debajo del 20% del entorno de
+    # los puntos de calibración (o directamente invertido), para ese eje se
+    # descarta el recorte por esquinas y se usa el entorno de los puntos tal
+    # cual, que es estable por construcción.
+    cal_span = cal_max - cal_min
+    result_span = world_max - world_min
+    degenerate = (result_span <= 0) | (result_span < 0.2 * cal_span)
+    world_min = np.where(degenerate, cal_min, world_min)
+    world_max = np.where(degenerate, cal_max, world_max)
 
     canvas_w = max(int(np.ceil((world_max[0] - world_min[0]) * px_per_meter)), 10)
     canvas_h = max(int(np.ceil((world_max[1] - world_min[1]) * px_per_meter)), 10)

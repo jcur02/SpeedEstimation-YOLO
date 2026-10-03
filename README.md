@@ -503,6 +503,21 @@ la precisión necesaria (7+ decimales). **Menos de 5 decimales se rechaza autom�
 que se note hasta que las velocidades salgan mal. En la séptima cifra decimal cada unidad
 vale aproximadamente un centímetro.
 
+**Formatos aceptados en el campo de coordenadas del selector:** se puede pegar el texto tal
+cual lo entrega Google Maps, con o sin espacios, con coma o solo espacio como separador, y
+con o sin el símbolo de grado:
+
+```
+9.8574123, -83.9112345
+9.8574123,-83.9112345
+9.8574123 -83.9112345
+9.8574123°, -83.9112345°
+```
+
+Si el primer valor pegado no puede ser una latitud válida (magnitud mayor que 90) pero el
+segundo sí, el selector asume que se pegaron invertidos (longitud, latitud) y ofrece
+intercambiarlos en vez de solo rechazar el punto.
+
 Qué puntos elegir: marcas pintadas sobre el asfalto — esquinas de cruces peatonales,
 extremos de líneas discontinuas, bordes de flechas viales. **Evitá bases de postes o
 esquinas de edificios**: si se comparan contra una imagen satelital, esos objetos altos
@@ -524,23 +539,23 @@ importa.
 
 La fuente de verdad es un archivo de puntos de correspondencia; el cálculo de la
 homografía lee ese archivo y nada más — funciona sin red, sin llave de API y sin interfaz
-gráfica, porque el destino final es una Raspberry Pi que puede correr sin conexión. El
-selector con imagen aérea (Modo A) es un front-end opcional cuyo único trabajo es escribir
-ese archivo con clics en vez de tipear latitud/longitud a mano; sin llave de MapTiler
-configurada, la herramienta cae automáticamente al modo manual y nada se rompe. La imagen
-aérea se descarga una sola vez y se guarda en disco junto a un `.meta.json` con su centro,
-zoom y tamaño — a partir de ahí el selector funciona sin red.
+gráfica, porque el destino final es una Raspberry Pi que puede correr sin conexión. La
+imagen aérea es un front-end opcional dentro del mismo selector gráfico, cuyo único trabajo
+es calcular esas coordenadas con un clic en vez de tipearlas o pegarlas a mano; sin llave de
+MapTiler configurada, la pestaña aérea simplemente no aparece y nada se rompe — el campo de
+texto sigue siendo la única vía de entrada, se llene a mano o con un clic sobre la aérea. La
+imagen aérea se descarga una sola vez y se guarda en disco junto a un `.meta.json` con su
+centro, zoom y tamaño — a partir de ahí el selector funciona sin red.
 
 **La llave de MapTiler va en la variable de entorno `MAPTILER_KEY`, nunca en el
 repositorio ni en el código.**
 
-### Los tres modos para obtener los puntos
+### Las dos formas de obtener los puntos
 
-| Modo | Cómo se activa | Cuándo usarlo |
+| Forma | Cómo se activa | Cuándo usarla |
 |---|---|---|
-| A: imagen aérea | `--fetch-aerial --center lat,lon` o `--aerial <img>` | Marcado por pares con clics; error de reproyección en vivo desde el quinto par. Requiere `MAPTILER_KEY`. |
-| B: manual | Sin flags (default, sin imagen aérea disponible) | Clic sobre la cámara, la consola pide lat/lon de ese punto. No requiere red. |
-| C: CSV | `--points archivo.csv` | El único reproducible: el CSV se versiona en el repositorio. No requiere display. |
+| Selector gráfico (Tkinter) | Sin `--no-gui` (default) | Clic sobre la cámara, coordenadas pegadas o tecleadas en un campo de texto. Con `--points`, arranca con esos puntos ya cargados para editarlos. Si hay imagen aérea disponible (`--fetch-aerial`/`--aerial`, o ya cacheada), agrega una pestaña donde un clic calcula la lat/lon en vez de escribirla. Requiere interfaz gráfica (y Tkinter instalado). |
+| CSV sin interfaz | `--points archivo.csv --no-gui` | La vía reproducible y apta para equipos sin pantalla: el CSV se versiona en el repositorio y no abre ninguna ventana. |
 
 ### Tabla de argumentos de `scripts/calibrate.py`
 
@@ -548,7 +563,7 @@ repositorio ni en el código.**
 |---|---|---|
 | `--video` | auto | Video del que se toma el frame de referencia. |
 | `--frame-sec` | frame medio | Segundo del frame de referencia. |
-| `--points` | None | CSV de puntos ya preparado; salta el marcado interactivo. |
+| `--points` | None | CSV de puntos ya preparado. Sin `--no-gui`, abre el selector con esos puntos cargados para editarlos; con `--no-gui`, los usa directamente sin abrir ventana. |
 | `--aerial` | None | Imagen aérea ya descargada (con su `.meta.json`). |
 | `--fetch-aerial` | False | Descarga la imagen aérea vía MapTiler. |
 | `--center` | None | `lat,lon` del centro para la descarga. |
@@ -557,23 +572,40 @@ repositorio ni en el código.**
 | `--output` | `config/calibration.json` | Dónde guardar. |
 | `--verify` | False | Modo verificación sobre una calibración existente. |
 | `--show` | False | Muestra la calibración guardada y sus reportes. |
+| `--no-gui` | False | Fuerza el modo sin interfaz gráfica. Requiere `--points`; no abre ninguna ventana. |
 
-### Controles del marcado interactivo
+### Controles del selector gráfico
 
-| Modo A (aérea) | Acción |
+| Entrada | Acción |
 |---|---|
-| Clic (alternando cámara → aérea) | Forma un par de puntos |
-| `z` | Deshace el último par (o el clic suelto si el par está a medias) |
-| `n` | Anota el último par |
-| `Enter` | Termina (mínimo 4 pares) |
-| `q` / `ESC` | Sale sin guardar, con confirmación |
+| Clic izquierdo sobre el lienzo | Marca (o reubica, si ya había uno pendiente) el punto pendiente; el foco salta al campo de coordenadas |
+| Rueda del mouse | Acerca/aleja centrado en el cursor (1.2× por paso, entre 0.25× y 8×) |
+| Arrastre con botón derecho o rueda presionada | Desplaza la vista |
+| `f` | Ajusta la imagen completa a la ventana |
+| `Ctrl+V` / botón "Pegar" | Pega el portapapeles en el campo de coordenadas |
+| `Enter` (en el campo) | Confirma el punto pendiente (equivale a "Agregar punto"/"Guardar cambios") |
+| `Ctrl+Z` | Deshace el último punto agregado |
+| `Supr` | Borra el punto seleccionado en la lista (reasigna las letras) |
+| `Ctrl+S` | Guarda y sale |
+| `Escape` / cerrar la ventana | Sale, pidiendo confirmación si hay puntos sin guardar |
 
-| Modo B (manual) | Acción |
-|---|---|
-| Clic sobre la cámara | Marca un punto; la consola pide su lat/lon |
-| `z` | Deshace el último punto |
-| `Enter` | Termina (mínimo 4 puntos) |
-| `q` / `ESC` | Sale sin guardar, con confirmación |
+Si hay pestaña aérea: hacer clic primero sobre la cámara (crea el punto pendiente), cambiar
+a la pestaña "Aérea" y hacer clic sobre el punto correspondiente rellena el campo de
+coordenadas automáticamente, con siete decimales. Se revisa y se confirma igual que si se
+hubiera pegado a mano — es el mismo campo de texto en los dos casos.
+
+El panel "Calidad" del costado se recalcula después de cada punto agregado, editado o
+borrado (a partir del cuarto): reproyección media, validación cruzada (desde el quinto
+punto), y cobertura del casco convexo, cada uno coloreado en verde/ámbar/rojo según los
+umbrales de `calibration.thresholds`. El punto de peor residuo se resalta en la lista y en
+el lienzo — casi siempre señala el decimal mal copiado o la esquina mal identificada. El
+selector guarda un borrador (`points.draft.csv`) después de cada punto confirmado, y lo
+ofrece recuperar si el programa se cerró de forma inesperada.
+
+**Tkinter en Linux:** en algunas distribuciones se instala aparte
+(`sudo apt install python3-tk`). Si falta, `calibrate.py` lo detecta al arrancar y sugiere
+preparar un CSV y usar `--points archivo.csv --no-gui` mientras tanto — la única vía sin
+interfaz gráfica, apta también para equipos sin pantalla (como la Raspberry Pi por SSH).
 
 | `--verify` | Acción |
 |---|---|
@@ -643,15 +675,18 @@ confiable (dentro del casco convexo de los puntos) y dónde es pura extrapolaci�
 ### Ejemplos de uso
 
 ```bash
-# Descargar imagen aérea y marcar por pares
+# Selector gráfico, con pestaña aérea (descarga la imagen la primera vez)
 export MAPTILER_KEY=...
 python scripts/calibrate.py --fetch-aerial --center 9.8574,-83.9112 --zoom 20
 
-# Modo manual, sin API
+# Selector gráfico, sin API (solo cámara)
 python scripts/calibrate.py
 
-# Desde un CSV versionado (reproducible)
+# Reabrir el selector con puntos ya marcados, para revisarlos o agregar más
 python scripts/calibrate.py --points config/points.csv
+
+# Desde un CSV versionado, sin abrir ventana (reproducible, apto para equipos sin pantalla)
+python scripts/calibrate.py --points config/points.csv --no-gui
 
 # Verificar la escala midiendo una distancia conocida
 python scripts/calibrate.py --verify
@@ -660,9 +695,10 @@ python scripts/calibrate.py --verify
 python scripts/calibrate.py --show
 ```
 
-Igual que `select_roi.py`, los modos A y B son inherentemente interactivos: sin `DISPLAY`
-disponible, el script lo detecta e indica preparar un CSV con `--points` en su lugar. El
-`calibration.json` resultante puede copiarse luego a la Raspberry Pi sin volver a calibrar.
+Igual que `select_roi.py`, el selector gráfico es inherentemente interactivo: sin `DISPLAY`
+disponible (o sin Tkinter instalado), el script lo detecta e indica preparar un CSV y usar
+`--points archivo.csv --no-gui` en su lugar. El `calibration.json` resultante puede copiarse
+luego a la Raspberry Pi sin volver a calibrar.
 
 ## Estimación de velocidad
 
