@@ -31,6 +31,11 @@ detection:
 
   confidence_threshold: 0.40
   iou_threshold: 0.45
+  # Unifica car/truck/bus/motorcycle bajo class_name="vehiculo" (class_id se conserva
+  # intacto). La distinción de clase no se usa en ningún punto del pipeline de
+  # velocidad; con agnostic_nms, mantener clases separadas abría la puerta a cajas
+  # duplicadas sobre un mismo vehículo si alguna se clasifica distinto entre frames.
+  unify_vehicle_classes: true
 
 benchmark:
   warmup_frames: 15          # Frames de calentamiento (no se miden)
@@ -87,7 +92,7 @@ tracking:
   tracker_config_dir: "config/trackers/"
   tracks_dir: "results/tracks/"
 
-  smoothing_window: 5               # Media móvil sobre los puntos de contacto (impar, 0 = sin suavizar)
+  smoothing_window: 0               # Media móvil sobre los puntos de contacto (impar, 0 = sin suavizar)
   min_track_frames: 10              # Menos que esto se considera fragmento
   min_displacement_px: 40           # Menos que esto se considera vehículo estacionado
   border_margin_px: 20              # Margen para considerar que un bbox toca el borde del frame
@@ -133,7 +138,7 @@ calibration:
 
 speed:
   estimator: "window"              # "window" | "endpoint" | "cumulative"
-  window_s: 0.7                    # Ancho de la ventana de ajuste, en segundos
+  window_s: 1.0                    # Ancho de la ventana de ajuste, en segundos
   min_window_points: 5             # Mínimo de puntos por ventana
   smoothing_window_metric: 5       # Suavizado en metros (impar, 0 = desactivado)
   skip_pixel_smoothing: true       # Evita suavizar dos veces si el seguimiento ya lo hizo

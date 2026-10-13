@@ -10,13 +10,17 @@ import glob
 import logging
 import os
 import sys
+from datetime import datetime
 
+import numpy as np
+import pandas as pd
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.detection.benchmark import YOLOBenchmark
 from src.utils.logging_setup import setup_logging
+from src.utils.metrics import get_gpu_info
 from src.utils.roi import load_roi, polygon_area_ratio
 
 logger = logging.getLogger(__name__)
@@ -61,6 +65,11 @@ def parse_args():
     parser.add_argument(
         "--roi-file", type=str, default=None,
         help="Ruta del archivo de ROI a usar. Default: roi.file del config.",
+    )
+    parser.add_argument(
+        "--repeats", type=int, default=1,
+        help="Repite la corrida completa N veces y reporta la variabilidad del fps_median "
+             "entre repeticiones (distinto de la variabilidad entre frames dentro de una corrida).",
     )
     return parser.parse_args()
 
@@ -135,14 +144,16 @@ def apply_overrides(config, args):
     return config
 
 
-def print_banner(config, video_path):
+def print_banner(config, video_path, repeats=1):
     """
     Imprime el encabezado con el resumen de configuración antes de iniciar
-    el benchmark.
+    el benchmark, incluidas las condiciones exactas de medición (GPU,
+    versión de PyTorch/CUDA) cuando el dispositivo es `cuda`.
 
     Parámetros:
         config (dict): configuración final (con overrides aplicados).
         video_path (str): ruta al video de prueba a usar.
+        repeats (int): cantidad de repeticiones de la corrida completa.
 
     Retorna:
         None
@@ -155,7 +166,15 @@ def print_banner(config, video_path):
     print(f"\n{line}")
     print("  Benchmark YOLO — Estimación de velocidad vehicular")
     print(f"  Video: {video_path}")
-    print(f"  Dispositivo: {device} | Frames: {max_frames} | Modelos: {n_models}")
+    repeats_suffix = f" | Repeticiones: {repeats}" if repeats > 1 else ""
+    print(f"  Dispositivo: {device} | Frames: {max_frames} | Modelos: {n_models}{repeats_suffix}")
+
+    if device == "cuda":
+        gpu_info = get_gpu_info()
+        if gpu_info["cuda_available"]:
+            print(f"  GPU: {gpu_info['gpu_name']} | PyTorch {gpu_info['torch_version']} | CUDA {gpu_info['cuda_version']}")
+        else:
+            print("  GPU: device=cuda configurado, pero CUDA no está disponible en este equipo.")
 
     roi_cfg = config.get("roi", {})
     if roi_cfg.get("enabled"):
@@ -180,6 +199,11 @@ def print_summary_table(summaries):
     cada modelo evaluado, ordenada por FPS medio descendente. Marca con
     *** el modelo con mejor FPS y con [!] los que superan 512 MB de RAM.
 
+    El tiempo de inferencia se muestra como "mediana (media)": la mediana
+    es la cifra principal por ser robusta a atípicos (Defecto 4); la media
+    queda entre paréntesis como referencia. Si algún modelo tuvo frames
+    atípicos (`outlier_frames > 0`), se advierte al final.
+
     Parámetros:
         summaries (list[dict]): resúmenes de todos los modelos evaluados.
 
@@ -194,27 +218,76 @@ def print_summary_table(summaries):
     best_fps_id = ordered[0]["model_id"]
 
     print("\n" + "═" * 22 + " RESULTADOS FINALES " + "═" * 22)
-    print(f'{"Modelo":<12}│ {"FPS med":>7} │ {"FPS p5":>6} │ {"Inf.ms":>7} │ {"RAM MB":>8} │ {"CPU%":>6} │ {"Veh/f":>6}')
-    print("─" * 12 + "┼" + "─" * 9 + "┼" + "─" * 8 + "┼" + "─" * 9 + "┼" + "─" * 10 + "┼" + "─" * 8 + "┼" + "─" * 7)
+    print(f'{"Modelo":<12}│ {"FPS med":>7} │ {"FPS p5":>6} │ {"Inf.ms (mediana/media)":>23} │ {"RAM MB":>8} │ {"CPU%":>6} │ {"Veh/f":>6}')
+    print("─" * 12 + "┼" + "─" * 9 + "┼" + "─" * 8 + "┼" + "─" * 25 + "┼" + "─" * 10 + "┼" + "─" * 8 + "┼" + "─" * 7)
 
     for s in ordered:
         name = s["model_id"] + ("***" if s["model_id"] == best_fps_id else "")
         ram_str = f'{s["ram_mb_mean"]:.0f}' + ("[!]" if s["ram_mb_mean"] > 512 else "")
+        inf_median = s.get("inference_ms_median", s["inference_ms_mean"])
+        inf_str = f'{inf_median:.1f} ({s["inference_ms_mean"]:.1f})'
 
         print(
             f'{name:<12}│ {s["fps_mean"]:>7.1f} │ {s["fps_p5"]:>6.1f} │ '
-            f'{s["inference_ms_mean"]:>7.1f} │ {ram_str:>8} │ '
+            f'{inf_str:>23} │ {ram_str:>8} │ '
             f'{s["cpu_percent_mean"]:>6.1f} │ {s["vehicles_per_frame_mean"]:>6.1f}'
         )
 
-    print("─" * 66)
+    print("─" * 82)
     print("*** Mejor FPS    [!] Supera 512 MB (límite típico RPi4)")
+
+    outliers = [s for s in ordered if s.get("outlier_frames", 0) > 0]
+    if outliers:
+        print()
+        for s in outliers:
+            print(
+                f"  ⚠ {s['model_id']}: {s['outlier_frames']} frame(s) atípico(s) "
+                f"(inference_ms > 10× la mediana) — revisá si hubo carga externa en el equipo durante la corrida."
+            )
+
+
+def print_reproducibility_summary(all_repeats, benchmarks_dir):
+    """
+    Con `--repeats > 1`: calcula la desviación estándar de `fps_median`
+    **entre repeticiones** (no entre frames dentro de una corrida) por
+    modelo, la imprime, y guarda una tabla combinada de todas las
+    repeticiones en un CSV con columna `repeat_idx`.
+
+    Parámetros:
+        all_repeats (list[list[dict]]): resúmenes por modelo, uno por
+            repetición (cada elemento ya trae `repeat_idx` agregado).
+        benchmarks_dir (str): directorio donde guardar la tabla combinada.
+
+    Retorna:
+        None
+    """
+    flat_rows = [row for rep in all_repeats for row in rep]
+    if not flat_rows:
+        return
+
+    df = pd.DataFrame(flat_rows)
+
+    print("\n" + "═" * 18 + " REPRODUCIBILIDAD ENTRE REPETICIONES " + "═" * 18)
+    print(f'{"Modelo":<12}│ {"fps_median (std entre repeticiones)":>38}')
+    print("─" * 12 + "┼" + "─" * 40)
+    for model_id, group in df.groupby("model_id"):
+        values = group["fps_median"].dropna().to_numpy(dtype=np.float64)
+        std = float(np.std(values, ddof=0)) if len(values) > 1 else 0.0
+        print(f'{model_id:<12}│ {std:>38.2f}')
+    print("─" * 53)
+
+    os.makedirs(benchmarks_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(benchmarks_dir, f"repeats_{timestamp}.csv")
+    df.to_csv(out_path, index=False)
+    print(f"\nTabla combinada de repeticiones (una fila por modelo y repetición): {out_path}")
 
 
 def main():
     """
     Punto de entrada principal: carga configuración, resuelve el video de
-    prueba, pide confirmación al usuario y ejecuta el benchmark completo.
+    prueba, pide confirmación al usuario y ejecuta el benchmark completo
+    (una vez, o `--repeats` veces para medir reproducibilidad).
 
     Retorna:
         None
@@ -234,22 +307,39 @@ def main():
         print(f"✗ El video especificado no existe: {video_path}")
         sys.exit(1)
 
-    print_banner(config, video_path)
+    print_banner(config, video_path, args.repeats)
 
     answer = input("\n¿Continuar? [S/n]: ").strip().lower()
     if answer not in ("", "s", "si", "sí", "y", "yes"):
         print("Benchmark cancelado por el usuario.")
         sys.exit(0)
 
-    logger.info("Iniciando benchmark sobre %s", video_path)
-    try:
-        benchmark = YOLOBenchmark(config, video_path)
-    except (FileNotFoundError, RuntimeError, ValueError) as exc:
-        print(f"✗ Error inicializando el benchmark: {exc}")
-        sys.exit(1)
+    logger.info("Iniciando benchmark sobre %s (%d repetición/es)", video_path, args.repeats)
 
-    summaries = benchmark.run()
-    print_summary_table(summaries)
+    all_repeats = []
+    for repeat_idx in range(args.repeats):
+        if args.repeats > 1:
+            print(f"\n{'=' * 64}\n  Repetición {repeat_idx + 1}/{args.repeats}\n{'=' * 64}")
+
+        try:
+            benchmark = YOLOBenchmark(config, video_path)
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            print(f"✗ Error inicializando el benchmark: {exc}")
+            sys.exit(1)
+
+        summaries = benchmark.run()
+        for s in summaries:
+            s["repeat_idx"] = repeat_idx
+        all_repeats.append(summaries)
+
+    if not any(all_repeats):
+        print_summary_table([])
+        return
+
+    print_summary_table(all_repeats[-1])
+
+    if args.repeats > 1:
+        print_reproducibility_summary(all_repeats, config["paths"].get("benchmarks", "results/benchmarks/"))
 
 
 if __name__ == "__main__":

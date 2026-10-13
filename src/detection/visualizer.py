@@ -43,7 +43,6 @@ _CLASS_COLORS = {
     "motorcycle": (0, 255, 255),
 }
 _DEFAULT_COLOR = (200, 200, 200)
-_VEHICLE_CLASS_NAMES = ["car", "truck", "bus", "motorcycle"]
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 # Códigos de flecha derecha devueltos por cv2.waitKeyEx según plataforma y
@@ -289,19 +288,30 @@ class DetectionVisualizer:
 
     def _count_by_class(self, detections: List[Dict[str, Any]]) -> Dict[str, int]:
         """
-        Cuenta detecciones por clase de vehículo.
+        Cuenta detecciones por clase real de vehículo, para el desglose del HUD.
+
+        Cuenta por `class_id` — nunca por `class_name`: con
+        `detection.unify_vehicle_classes` activo, `class_name` vale
+        "vehiculo" para todas las detecciones por igual, y agrupar por ese
+        campo dejaría este desglose siempre en cero. `class_id` preserva
+        siempre la clase real que entregó el modelo, así que el HUD sigue
+        mostrando el desglose real (ej. "car 2 · truck 1") sin importar el
+        flag.
 
         Parámetros:
             detections (list[dict]): detecciones retornadas por `detect()`.
 
         Retorna:
-            dict: conteo por clase, con las 4 clases siempre presentes
-            (aunque su valor sea 0).
+            dict: conteo por clase real, con las clases de
+            `self.detector.vehicle_classes` siempre presentes (aunque su
+            valor sea 0).
         """
-        counts = {name: 0 for name in _VEHICLE_CLASS_NAMES}
+        id_to_name = self.detector.vehicle_classes
+        counts = {name: 0 for name in id_to_name.values()}
         for det in detections:
-            if det["class_name"] in counts:
-                counts[det["class_name"]] += 1
+            name = id_to_name.get(det["class_id"])
+            if name is not None:
+                counts[name] += 1
         return counts
 
     def _resize_for_display(self, frame: np.ndarray) -> np.ndarray:

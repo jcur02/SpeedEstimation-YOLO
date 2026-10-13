@@ -54,6 +54,11 @@ class VehicleDetector:
         self.vehicle_classes = detection_cfg.get("vehicle_classes", {})
         self.confidence_threshold = detection_cfg.get("confidence_threshold", 0.40)
         self.iou_threshold = detection_cfg.get("iou_threshold", 0.45)
+        # Nombre de presentación unificado; class_id SIEMPRE queda sin tocar (ver detect()),
+        # así que cualquier conteo que agrupe por class_id en vez de class_name (como
+        # YOLOBenchmark._process_video o DetectionVisualizer._count_by_class) no se ve
+        # afectado por este flag.
+        self.unify_vehicle_classes = detection_cfg.get("unify_vehicle_classes", False)
 
         models_dir = config.get("paths", {}).get("models", "models/")
         os.makedirs(models_dir, exist_ok=True)
@@ -95,6 +100,11 @@ class VehicleDetector:
             conf=self.confidence_threshold,
             iou=self.iou_threshold,
             device=self.device,
+            # Evita cajas duplicadas de clases distintas sobre un mismo objeto: el NMS por
+            # defecto de Ultralytics solo compara cajas DENTRO de cada clase, así que una
+            # caja "car" y una "truck" casi idénticas sobre el mismo vehículo sobreviven
+            # las dos. agnostic_nms las compara entre sí también.
+            agnostic_nms=True,
             verbose=False,
         )
 
@@ -108,14 +118,32 @@ class VehicleDetector:
                 continue
 
             x1, y1, x2, y2 = box.xyxy[0].tolist()
+            class_name = "vehiculo" if self.unify_vehicle_classes else self.vehicle_classes[class_id]
             detections.append({
                 "class_id": class_id,
-                "class_name": self.vehicle_classes[class_id],
+                "class_name": class_name,
                 "confidence": float(box.conf[0]),
                 "bbox": [float(x1), float(y1), float(x2), float(y2)],
             })
 
         return detections
+
+    def synchronize(self):
+        """
+        Espera a que terminen las operaciones pendientes en el dispositivo.
+
+        En CUDA la inferencia es asíncrona: la llamada al modelo retorna antes de que el
+        kernel termine. Actualmente la extracción de detecciones sincroniza de forma
+        implícita al convertir tensores a tipos de Python (`int(box.cls[0])`, etc.), pero
+        eso solo ocurre si hay al menos una caja detectada. Esta barrera explícita hace la
+        medición independiente de ese efecto colateral. En CPU es un no-op.
+
+        Retorna:
+            None
+        """
+        if self.device == "cuda":
+            import torch
+            torch.cuda.synchronize()
 
     def draw_detections(self, frame, detections):
         """

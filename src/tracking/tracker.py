@@ -42,7 +42,11 @@ class VehicleTracker:
             config (dict): configuración completa cargada desde config.yaml.
             source_fps (float): FPS del video de origen, usados para
                 construir la `TimeBase` de este tracker.
-            roi_filter: por ahora siempre None (ver nota más abajo).
+            roi_filter (ROIFilter | None): filtro de región de interés ya
+                construido para la resolución del video. Si no es None,
+                `update()` descarta (no crea ni alimenta ningún Track para)
+                las detecciones cuyo punto de contacto caiga fuera del
+                polígono. None desactiva el filtrado por completo.
 
         Retorna:
             None
@@ -78,6 +82,9 @@ class VehicleTracker:
         self.vehicle_class_ids = list(self.vehicle_classes.keys())
         self.conf = detection_cfg.get("confidence_threshold", 0.40)
         self.iou = detection_cfg.get("iou_threshold", 0.45)
+        # Ver VehicleDetector.unify_vehicle_classes: mismo flag, mismo significado.
+        # class_id (abajo, en update()) se conserva sin tocar en los dos casos.
+        self.unify_vehicle_classes = detection_cfg.get("unify_vehicle_classes", False)
         self.device = config.get("benchmark", {}).get("device", "cpu")
 
         models_dir = config.get("paths", {}).get("models", "models/")
@@ -108,14 +115,10 @@ class VehicleTracker:
         self.time_base = TimeBase(source_fps)
         self.source_fps = source_fps
 
-        # Punto de extensión documentado para la ROI: todavía no implementada
-        # para el pipeline de seguimiento. Cuando exista, el filtro se
-        # aplicaría acá mismo, en update(), justo después de extraer
-        # `detections` y antes de crear/actualizar los Track — descartando
-        # (o marcando) las detecciones cuyo punto de tierra caiga fuera del
-        # polígono, igual que ya hace `DetectionVisualizer._detect_with_roi`
-        # para el modo de solo-detección. No se escribe esa lógica todavía:
-        # el parámetro se guarda sin usarse para no romper nada al engancharla.
+        # ROI: se aplica en update(), justo después de extraer cada detección y antes
+        # de crear/actualizar su Track (ver abajo) — descartando las detecciones cuyo
+        # punto de contacto caiga fuera del polígono, igual que ya hace
+        # `DetectionVisualizer._detect_with_roi` para el modo de solo-detección.
         self.roi_filter = roi_filter
 
         self.tracks: Dict[int, Track] = {}
@@ -155,6 +158,10 @@ class VehicleTracker:
             iou=self.iou,
             classes=self.vehicle_class_ids,
             device=self.device,
+            # Mismo motivo que en VehicleDetector.detect(): sin esto, dos cajas de clases
+            # distintas sobre un mismo vehículo no se suprimen entre sí y el tracker les
+            # abre un track_id separado a cada una (trayectorias fantasma).
+            agnostic_nms=True,
             verbose=False,
         )
 
@@ -180,8 +187,14 @@ class VehicleTracker:
             if class_id not in self.vehicle_classes:
                 continue
 
-            class_name = self.vehicle_classes[class_id]
             bbox_list = [float(v) for v in bbox]
+
+            if self.roi_filter is not None and not self.roi_filter.contains(bbox_list):
+                # Fuera de la zona calibrada: no se crea ni alimenta ningún Track con
+                # esta detección, así nunca llega a formar parte de ninguna trayectoria.
+                continue
+
+            class_name = "vehiculo" if self.unify_vehicle_classes else self.vehicle_classes[class_id]
 
             if track_id not in self.tracks:
                 self.tracks[track_id] = Track(track_id)
@@ -196,6 +209,60 @@ class VehicleTracker:
             })
 
         return detections
+
+    def synchronize(self) -> None:
+        """
+        Espera a que terminen las operaciones pendientes en el dispositivo.
+
+        Mismo motivo que `VehicleDetector.synchronize()`: en CUDA la inferencia es
+        asíncrona, y sin esta barrera una medición de tiempo alrededor de `update()`
+        puede estar midiendo solo el encolado, no la ejecución real. En CPU es un no-op.
+
+        Retorna:
+            None
+        """
+        if self.device == "cuda":
+            import torch
+            torch.cuda.synchronize()
+
+    def reset_state(self) -> None:
+        """
+        Limpia todo el estado acumulado por este tracker: los `Track` propios
+        (`self.tracks`), el contador de frames procesados, y el estado interno
+        del tracker de Ultralytics (BYTETrack/BoT-SORT) — posiciones, filtros
+        de Kalman y el contador de IDs.
+
+        Pensado para usarse después de un calentamiento con inferencia real
+        (ver `scripts/run_tracking_benchmark.py`): `model.track(...,
+        persist=True)` mantiene estado entre llamadas, así que sin este reset
+        los vehículos "vistos" durante el calentamiento ensuciarían el conteo
+        de IDs únicos y las trayectorias de la ventana que sí se mide.
+
+        Si la versión de Ultralytics instalada no expone el tracker interno
+        donde se esperaba (`model.predictor.trackers`), se advierte y se
+        continúa solo con el reset del estado propio — mejor una limpieza
+        parcial que una excepción.
+
+        Retorna:
+            None
+        """
+        self.tracks = {}
+        self.frames_processed = 0
+
+        try:
+            predictor = getattr(self.model, "predictor", None)
+            trackers = getattr(predictor, "trackers", None) if predictor is not None else None
+            if trackers:
+                for internal_tracker in trackers:
+                    internal_tracker.reset()
+            else:
+                logger.warning(
+                    "No se encontró el tracker interno de Ultralytics (model.predictor.trackers) "
+                    "para reiniciar; el estado propio sí se reinició, pero los IDs internos "
+                    "pueden seguir arrastrando el calentamiento."
+                )
+        except Exception as exc:
+            logger.warning("No se pudo reiniciar el tracker interno de Ultralytics: %s", exc)
 
     def finalize(self) -> Dict[str, Any]:
         """

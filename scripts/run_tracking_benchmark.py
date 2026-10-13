@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.tracking.tracker import VehicleTracker
 from src.tracking.quality import TrackingQuality
 from src.utils.metrics import SystemMetrics
+from src.utils.roi import ROIFilter, load_roi
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,16 @@ def parse_args() -> argparse.Namespace:
         "--no-save-tracks", action="store_true",
         help="No escribe los JSON de trayectorias en results/tracks/.",
     )
+    parser.add_argument(
+        "--roi", action="store_true",
+        help="Activa el filtrado por región de interés (requiere haberla marcado con select_roi.py).",
+    )
+    parser.add_argument(
+        "--roi-file", type=str, default=None,
+        help="Ruta del archivo de ROI a usar. A diferencia de run_benchmark.py, pasar "
+             "--roi-file por sí solo ya activa la ROI (no hace falta --roi además): acá no "
+             "hay un modo intermedio donde tenga sentido cargar un archivo de ROI sin usarlo.",
+    )
     return parser.parse_args()
 
 
@@ -151,6 +162,11 @@ def apply_overrides(config: dict, args: argparse.Namespace) -> dict:
         config["detection"]["confidence_threshold"] = args.conf
     if args.device is not None:
         config.setdefault("benchmark", {})["device"] = args.device
+    if args.roi:
+        config.setdefault("roi", {})["enabled"] = True
+    if args.roi_file is not None:
+        config.setdefault("roi", {})["file"] = args.roi_file
+        config["roi"]["enabled"] = True
     return config
 
 
@@ -227,39 +243,68 @@ def peek_video_info(video_path: str) -> Tuple[int, float, int, int]:
     return total_frames, fps, width, height
 
 
-def find_latest_detection_summary(benchmarks_dir: str) -> Tuple[Optional[dict], Optional[str]]:
+def find_latest_detection_summary(
+    benchmarks_dir: str, device: str,
+) -> Tuple[Optional[dict], Optional[str], Optional[str]]:
     """
     Busca el JSON de resumen de benchmark de detección pura más reciente en
-    `results/benchmarks/`, para cuantificar el overhead del tracking.
+    `results/benchmarks/` **que haya corrido en el mismo `device`** que esta
+    corrida de seguimiento, para cuantificar el overhead del tracking.
+
+    Un resumen de otro dispositivo no sirve de referencia: compararía
+    tiempos de CPU contra CUDA, lo que puede dar un overhead negativo
+    (imposible) o inflado sin sentido.
+
+    Parámetros:
+        benchmarks_dir (str): directorio donde buscar.
+        device (str): dispositivo de esta corrida de seguimiento ("cpu" o
+            "cuda"); solo se acepta un resumen que coincida.
 
     Retorna:
-        tuple[dict | None, str | None]: (contenido del summary, ruta), o
-        (None, None) si no hay ninguno o todos están corruptos.
+        tuple[dict | None, str | None, str | None]: (contenido del summary
+        compatible, su ruta, None) si se encontró uno; si no, (None, None,
+        device_mas_reciente_visto) para poder avisar con qué dispositivo SÍ
+        había resúmenes disponibles. Si no hay ningún resumen (ni siquiera
+        de otro dispositivo), el tercer elemento también es None.
     """
     paths = sorted(glob.glob(os.path.join(benchmarks_dir, "summary_*.json")), reverse=True)
+    most_recent_other_device: Optional[str] = None
     for path in paths:
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f), path
+                data = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
-    return None, None
+        summary_device = data.get("config", {}).get("benchmark", {}).get("device")
+        if summary_device == device:
+            return data, path, None
+        if most_recent_other_device is None:
+            most_recent_other_device = summary_device
+    return None, None, most_recent_other_device
 
 
-def detection_only_stats(summary_data: Optional[dict], model_id: str) -> Optional[Dict[str, float]]:
+def detection_only_stats(
+    summary_data: Optional[dict], model_id: str, device: str,
+) -> Optional[Dict[str, Any]]:
     """
-    Extrae `fps_mean`/`inference_ms_mean` de un modelo dentro de un summary
-    de benchmark de detección pura.
+    Extrae `fps_mean`/`inference_ms_mean`/`frames_processed` de un modelo
+    dentro de un summary de benchmark de detección pura, exigiendo que
+    coincidan tanto `model_id` **como** `device` — mezclar dispositivos
+    produce un overhead sin sentido (hasta negativo, que es imposible).
 
     Retorna:
-        dict | None: `{"fps_mean", "inference_ms_mean"}`, o None si no hay
-        summary o el modelo no aparece en él.
+        dict | None: `{"fps_mean", "inference_ms_mean", "frames_processed"}`,
+        o None si no hay summary o el modelo no aparece con ese device.
     """
     if summary_data is None:
         return None
     for m in summary_data.get("models", []):
-        if m.get("model_id") == model_id:
-            return {"fps_mean": m.get("fps_mean"), "inference_ms_mean": m.get("inference_ms_mean")}
+        if m.get("model_id") == model_id and m.get("device") == device:
+            return {
+                "fps_mean": m.get("fps_mean"),
+                "inference_ms_mean": m.get("inference_ms_mean"),
+                "frames_processed": m.get("frames_processed"),
+            }
     return None
 
 
@@ -290,15 +335,44 @@ def print_banner(video_path: str, models: List[dict], trackers: List[str],
             print(f"  - {model_cfg['id']} + {tracker_name}")
 
 
+def _trimmed_mean(values: Any, trim_frac: float = 0.05) -> float:
+    """
+    Media recortada: descarta la fracción `trim_frac` de valores más bajos y
+    más altos antes de promediar, para que uno o dos atípicos no desplacen
+    el resultado. Misma definición que `src.detection.benchmark._trimmed_mean`
+    (duplicada acá en vez de importada, para no tocar ese módulo), así las
+    dos salidas son comparables.
+
+    Parámetros:
+        values (array-like): valores a promediar.
+        trim_frac (float): fracción a recortar de cada cola (0.05 = 5%).
+
+    Retorna:
+        float: media recortada. Si el recorte dejaría 0 o menos valores,
+        promedia sin recortar.
+    """
+    arr = np.sort(np.asarray(values, dtype=np.float64))
+    n = len(arr)
+    k = int(np.floor(n * trim_frac))
+    trimmed = arr[k:n - k] if n - 2 * k > 0 else arr
+    return float(np.mean(trimmed))
+
+
 def run_one_combination(
     model_cfg: dict, tracker_name: str, config: dict, video_path: str,
     frames_to_process: int, source_fps: float, width: int, height: int,
-    tracks_dir: str, save_tracks: bool,
+    tracks_dir: str, save_tracks: bool, roi_filter: Optional[Any] = None,
 ) -> Tuple[Dict[str, Any], VehicleTracker]:
     """
-    Corre una combinación (modelo, tracker) completa sobre el video: recorre
-    los frames con `tqdm`, mide tiempo por frame y muestrea métricas de
-    sistema, finaliza el tracker y calcula sus métricas de calidad.
+    Corre una combinación (modelo, tracker) completa sobre el video: calienta
+    con inferencia real, reinicia el estado del tracker, recorre los frames
+    medidos con `tqdm` sincronizando el dispositivo en cada uno, finaliza el
+    tracker y calcula sus métricas de calidad.
+
+    Parámetros:
+        roi_filter (ROIFilter | None): si no es None, se pasa al
+            `VehicleTracker` para que descarte detecciones fuera de la zona
+            (ver `VehicleTracker.update`).
 
     Retorna:
         tuple[dict, VehicleTracker]: (fila de resultados para la tabla
@@ -306,12 +380,13 @@ def run_one_combination(
     """
     # Instancia nueva de VehicleTracker (y por lo tanto de YOLO) para esta
     # combinación exacta: ver la decisión de diseño C en VehicleTracker.
-    tracker = VehicleTracker(model_cfg["id"], model_cfg["weights"], tracker_name, config, source_fps)
+    tracker = VehicleTracker(
+        model_cfg["id"], model_cfg["weights"], tracker_name, config, source_fps, roi_filter=roi_filter,
+    )
     tracker.source_video = video_path
     tracker.frame_size = (width, height)
 
-    system_metrics = SystemMetrics()
-    system_metrics.start()
+    warmup_frames = config.get("benchmark", {}).get("warmup_frames", 15)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -321,20 +396,60 @@ def run_one_combination(
     system_samples: List[Dict[str, float]] = []
 
     try:
+        # Calentamiento con inferencia real (no solo cap.read()): el primer
+        # `model.track()` paga la inicialización del contexto CUDA, el
+        # autotuning de cuDNN y la transferencia de pesos a la GPU -- en este
+        # equipo, ese costo se midió en hasta ~8.8 segundos sobre un solo
+        # frame. Sin calentar con inferencia real, ese costo cae dentro del
+        # primer frame medido y arruina media, std y hasta el orden esperado
+        # entre modelos. `persist=True` acumula tracks entre llamadas, así
+        # que el estado se reinicia después (ver reset_state() más abajo) para
+        # que los vehículos "vistos" durante el calentamiento no ensucien el
+        # conteo de IDs únicos ni las trayectorias de la ventana medida.
+        print(f"  ⏳ Calentamiento ({warmup_frames} frames)...")
+        warmed = 0
+        for _ in range(warmup_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            tracker.update(frame, warmed)
+            warmed += 1
+
+        if warmed == 0:
+            logger.warning(
+                "No se pudo calentar el modelo %s+%s: el video no tiene frames suficientes. "
+                "Las primeras mediciones incluirán el costo de inicialización.",
+                model_cfg["id"], tracker_name,
+            )
+
+        tracker.reset_state()
+        tracker.synchronize()
+
+        system_metrics = SystemMetrics()
+        system_metrics.start()
+
+        # frame_idx continúa desde `warmed`, no reinicia en 0: así `t_video`
+        # (frame_idx / source_fps, ver TimeBase) sigue anclado a la posición
+        # real del video incluso con calentamiento consumiendo los primeros
+        # frames del archivo.
         with tqdm(total=frames_to_process, desc=f"{model_cfg['id']} + {tracker_name}", unit="frame") as progress:
-            frame_idx = 0
-            while frame_idx < frames_to_process:
+            frame_idx = warmed
+            frames_measured = 0
+            while frames_measured < frames_to_process:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
+                tracker.synchronize()  # no arrastrar trabajo pendiente del frame previo
                 t0 = time.perf_counter()
                 tracker.update(frame, frame_idx)
+                tracker.synchronize()  # esperar a que la inferencia de este frame termine de verdad
                 t1 = time.perf_counter()
 
                 inference_times.append((t1 - t0) * 1000.0)
                 system_samples.append(system_metrics.measure())
                 frame_idx += 1
+                frames_measured += 1
                 progress.update(1)
     finally:
         cap.release()
@@ -353,18 +468,27 @@ def run_one_combination(
     fps_arr = np.where(inference_arr > 0, 1000.0 / inference_arr, 0.0)
     ram_arr = np.array([s["ram_mb"] for s in system_samples]) if system_samples else np.array([0.0])
     cpu_arr = np.array([s["cpu_percent"] for s in system_samples]) if system_samples else np.array([0.0])
+    inference_ms_median = float(np.median(inference_arr))
 
     row: Dict[str, Any] = {
         "model_id": model_cfg["id"],
         "tracker": tracker_name,
+        "device": tracker.device,
         "frames_processed": len(inference_times),
         "fps_mean": float(fps_arr.mean()),
         "fps_std": float(fps_arr.std(ddof=0)),
         "fps_p5": float(np.percentile(fps_arr, 5)) if len(fps_arr) else 0.0,
+        "fps_median": float(np.median(fps_arr)),
         "inference_ms_mean": float(inference_arr.mean()),
         "inference_ms_std": float(inference_arr.std(ddof=0)),
+        "inference_ms_median": inference_ms_median,
+        "inference_ms_p95": float(np.percentile(inference_arr, 95)),
+        "inference_ms_trimmed_mean": _trimmed_mean(inference_arr),
+        "outlier_frames": int(np.sum(inference_arr > 10 * inference_ms_median)) if inference_ms_median > 0 else 0,
         "ram_mb_mean": float(ram_arr.mean()),
         "cpu_percent_mean": float(cpu_arr.mean()),
+        "roi_enabled": roi_filter is not None,
+        "roi_area_ratio": roi_filter.area_ratio() if roi_filter is not None else None,
         "tracks_path": tracks_path,
     }
     row.update(quality)
@@ -566,12 +690,33 @@ def main() -> None:
     os.makedirs(benchmarks_dir, exist_ok=True)
     os.makedirs(plots_dir, exist_ok=True)
 
-    detection_summary, detection_summary_path = find_latest_detection_summary(benchmarks_dir)
+    device = config.get("benchmark", {}).get("device", "cpu")
+
+    roi_cfg = config.get("roi", {})
+    roi_filter = None
+    if roi_cfg.get("enabled"):
+        roi_path = roi_cfg.get("file", "config/roi.json")
+        try:
+            roi_data = load_roi(roi_path)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"✗ Error cargando la ROI: {exc}")
+            sys.exit(1)
+        roi_filter = ROIFilter(roi_data, (width, height), config)
+        print(f"\nROI activa para este benchmark de seguimiento ({roi_filter.area_ratio() * 100:.1f}% del frame)")
+
+    detection_summary, detection_summary_path, seen_other_device = find_latest_detection_summary(
+        benchmarks_dir, device,
+    )
     if detection_summary_path:
-        print(f"\nUsando benchmark de detección pura como referencia de overhead: {detection_summary_path}")
+        print(f"\nUsando benchmark de detección pura como referencia de overhead: "
+              f"{detection_summary_path} (device={device})")
     else:
-        print("\n(No se encontró un benchmark de detección pura previo en "
-              f"{benchmarks_dir}; se omite la columna de overhead sin fallar.)")
+        extra = f" (el más reciente disponible fue en device='{seen_other_device}')" if seen_other_device else ""
+        print(
+            f"\n⚠ No se encontró un benchmark de detección pura en device='{device}' en {benchmarks_dir}{extra}. "
+            f"Se omite la columna de overhead sin fallar. Corré 'python scripts/run_benchmark.py "
+            f"--device {device}' primero si querés esa comparación."
+        )
 
     logger.info("Iniciando benchmark de seguimiento sobre %s", video_path)
 
@@ -588,14 +733,14 @@ def main() -> None:
             try:
                 row, _tracker = run_one_combination(
                     model_cfg, tracker_name, config, video_path, frames_to_process,
-                    source_fps, width, height, tracks_dir, not args.no_save_tracks,
+                    source_fps, width, height, tracks_dir, not args.no_save_tracks, roi_filter,
                 )
             except Exception as exc:
                 logger.error("Error evaluando %s + %s: %s", model_cfg["id"], tracker_name, exc, exc_info=True)
                 print(f"  ✗ Error evaluando {model_cfg['id']} + {tracker_name}: {exc}")
                 continue
 
-            det_stats = detection_only_stats(detection_summary, model_cfg["id"])
+            det_stats = detection_only_stats(detection_summary, model_cfg["id"], device)
             if det_stats is not None and det_stats.get("inference_ms_mean"):
                 row["detection_only_fps_mean"] = det_stats["fps_mean"]
                 row["detection_only_inference_ms_mean"] = det_stats["inference_ms_mean"]
@@ -603,11 +748,30 @@ def main() -> None:
                 row["tracking_overhead_pct"] = (
                     100.0 * row["tracking_overhead_ms"] / det_stats["inference_ms_mean"]
                 )
+                row["detection_baseline_path"] = detection_summary_path
+                row["detection_baseline_device"] = device
+
+                baseline_frames = det_stats.get("frames_processed")
+                if baseline_frames is not None and baseline_frames != row["frames_processed"]:
+                    print(
+                        f"  ⚠ El baseline de detección procesó {baseline_frames} frames; esta corrida de "
+                        f"seguimiento procesó {row['frames_processed']}. El overhead no es estrictamente comparable."
+                    )
+                baseline_roi_enabled = bool(detection_summary.get("roi", {}).get("enabled", False))
+                if baseline_roi_enabled != bool(row["roi_enabled"]):
+                    print(
+                        f"  ⚠ El baseline de detección tiene ROI "
+                        f"{'activa' if baseline_roi_enabled else 'inactiva'}, pero esta corrida de seguimiento "
+                        f"tiene ROI {'activa' if row['roi_enabled'] else 'inactiva'}. El overhead no es "
+                        f"estrictamente comparable."
+                    )
             else:
                 row["detection_only_fps_mean"] = None
                 row["detection_only_inference_ms_mean"] = None
                 row["tracking_overhead_ms"] = None
                 row["tracking_overhead_pct"] = None
+                row["detection_baseline_path"] = None
+                row["detection_baseline_device"] = None
 
             rows.append(row)
             print(

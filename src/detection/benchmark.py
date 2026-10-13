@@ -22,10 +22,61 @@ from src.utils.roi import ROIFilter, load_roi
 
 logger = logging.getLogger(__name__)
 
-_VEHICLE_CLASS_NAMES = ["car", "truck", "bus", "motorcycle"]
+# Fracción recortada de cada cola para la media recortada de Defecto 4 (5% = recorte
+# moderado, suficiente para neutralizar uno o dos atípicos sin descartar datos válidos).
+_TRIM_FRAC = 0.05
 # Raíz del proyecto (src/detection/benchmark.py -> src/detection -> src -> raíz),
 # necesaria para invocar el worker aislado como `python -m src.detection.worker`.
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _trimmed_mean(values, trim_frac=_TRIM_FRAC):
+    """
+    Media recortada: descarta la fracción `trim_frac` de valores más bajos y
+    más altos antes de promediar, para que uno o dos atípicos no desplacen
+    el resultado. Implementada con numpy puro para no agregar scipy como
+    dependencia.
+
+    Parámetros:
+        values (array-like): valores a promediar.
+        trim_frac (float): fracción a recortar de cada cola (0.05 = 5%).
+
+    Retorna:
+        float: media recortada. Si el recorte dejaría 0 o menos valores,
+        promedia sin recortar.
+    """
+    arr = np.sort(np.asarray(values, dtype=np.float64))
+    n = len(arr)
+    k = int(np.floor(n * trim_frac))
+    trimmed = arr[k:n - k] if n - 2 * k > 0 else arr
+    return float(np.mean(trimmed))
+
+
+def _counts_by_name(detections, vehicle_classes):
+    """
+    Cuenta detecciones por nombre de clase real (car/truck/bus/motorcycle),
+    a partir de `class_id` — nunca de `class_name`. Con
+    `detection.unify_vehicle_classes` activo, `class_name` vale "vehiculo"
+    para todas las detecciones por igual, así que agrupar por ese campo
+    dejaría el conteo por clase real vacío (o, agrupando contra un dict con
+    las 4 claves fijas, directamente un `KeyError`). `class_id` en cambio
+    siempre preserva la clase real que entregó el modelo.
+
+    Parámetros:
+        detections (list[dict]): detecciones con clave "class_id".
+        vehicle_classes (dict[int, str]): mapeo class_id -> nombre real, tal
+            como lo expone `VehicleDetector.vehicle_classes`.
+
+    Retorna:
+        dict[str, int]: conteo por nombre real, con todas las clases del
+        mapeo siempre presentes (aunque valgan 0).
+    """
+    counts = {name: 0 for name in vehicle_classes.values()}
+    for det in detections:
+        name = vehicle_classes.get(det["class_id"])
+        if name is not None:
+            counts[name] += 1
+    return counts
 
 
 class YOLOBenchmark:
@@ -104,8 +155,9 @@ class YOLOBenchmark:
             list[dict]: una entrada por frame procesado, con las claves
             frame_idx, inference_ms, fps, vehicle_count, car_count,
             truck_count, bus_count, motorcycle_count, avg_confidence,
-            cpu_percent y ram_mb, más las columnas adicionales
-            vehicle_count_roi, car_count_roi, truck_count_roi,
+            cpu_percent, ram_mb, gpu_mem_allocated_mb y gpu_mem_peak_mb
+            (estas dos últimas None si no hay CUDA), más las columnas
+            adicionales vehicle_count_roi, car_count_roi, truck_count_roi,
             bus_count_roi y motorcycle_count_roi (iguales a sus contrapartes
             sin sufijo si no hay ROI activa).
         """
@@ -122,12 +174,30 @@ class YOLOBenchmark:
         if save_annotated:
             os.makedirs(model_frames_dir, exist_ok=True)
 
+        # El calentamiento tiene que ejecutar inferencia de verdad, no solo avanzar el
+        # video: la primera llamada real al modelo paga la inicialización del contexto
+        # CUDA, el autotuning de cuDNN y la transferencia de los pesos a la GPU — en este
+        # equipo, ese costo se midió en hasta 22 segundos. Si el calentamiento no corre el
+        # modelo, ese costo cae dentro del frame 0 ya medido y arruina las estadísticas de
+        # todo el modelo (media, std y hasta el orden esperado entre modelos).
         print(f"  ⏳ Calentamiento ({warmup_frames} frames)...")
+        warmed = 0
         for _ in range(warmup_frames):
-            ret, _ = cap.read()
+            ret, frame = cap.read()
             if not ret:
                 break
+            detector.detect(frame)
+            warmed += 1
 
+        if warmed == 0:
+            logger.warning(
+                "No se pudo calentar el modelo: el video no tiene frames suficientes. "
+                "Las primeras mediciones incluirán el costo de inicialización."
+            )
+
+        detector.synchronize()
+
+        self.metrics.reset_gpu_peak()
         self.metrics.start()
         frame_data = []
 
@@ -138,32 +208,33 @@ class YOLOBenchmark:
                 logger.info("Video agotado en el frame %d (antes de llegar a max_frames).", frame_idx)
                 break
 
+            detector.synchronize()  # no arrastrar trabajo pendiente del frame previo
             t_start = time.perf_counter()
             detections = detector.detect(frame)
+            detector.synchronize()  # esperar a que la inferencia de este frame termine de verdad
             t_end = time.perf_counter()
 
             inference_ms = (t_end - t_start) * 1000.0
             fps = 1000.0 / inference_ms if inference_ms > 0 else 0.0
             sys_metrics = self.metrics.measure()
 
-            counts = {name: 0 for name in _VEHICLE_CLASS_NAMES}
-            confidences = []
-            for det in detections:
-                counts[det["class_name"]] += 1
-                confidences.append(det["confidence"])
+            counts = _counts_by_name(detections, detector.vehicle_classes)
+            confidences = [det["confidence"] for det in detections]
 
             row = {
                 "frame_idx": frame_idx,
                 "inference_ms": inference_ms,
                 "fps": fps,
                 "vehicle_count": len(detections),
-                "car_count": counts["car"],
-                "truck_count": counts["truck"],
-                "bus_count": counts["bus"],
-                "motorcycle_count": counts["motorcycle"],
+                "car_count": counts.get("car", 0),
+                "truck_count": counts.get("truck", 0),
+                "bus_count": counts.get("bus", 0),
+                "motorcycle_count": counts.get("motorcycle", 0),
                 "avg_confidence": float(np.mean(confidences)) if confidences else 0.0,
                 "cpu_percent": sys_metrics["cpu_percent"],
                 "ram_mb": sys_metrics["ram_mb"],
+                "gpu_mem_allocated_mb": sys_metrics.get("gpu_mem_allocated_mb"),
+                "gpu_mem_peak_mb": sys_metrics.get("gpu_mem_peak_mb"),
             }
 
             # Columnas adicionales de ROI, estrictamente al final: si no hay
@@ -174,15 +245,13 @@ class YOLOBenchmark:
             else:
                 inside = detections
 
-            roi_counts = {name: 0 for name in _VEHICLE_CLASS_NAMES}
-            for det in inside:
-                roi_counts[det["class_name"]] += 1
+            roi_counts = _counts_by_name(inside, detector.vehicle_classes)
 
             row["vehicle_count_roi"] = len(inside)
-            row["car_count_roi"] = roi_counts["car"]
-            row["truck_count_roi"] = roi_counts["truck"]
-            row["bus_count_roi"] = roi_counts["bus"]
-            row["motorcycle_count_roi"] = roi_counts["motorcycle"]
+            row["car_count_roi"] = roi_counts.get("car", 0)
+            row["truck_count_roi"] = roi_counts.get("truck", 0)
+            row["bus_count_roi"] = roi_counts.get("bus", 0)
+            row["motorcycle_count_roi"] = roi_counts.get("motorcycle", 0)
 
             frame_data.append(row)
 
@@ -207,12 +276,24 @@ class YOLOBenchmark:
             dict: resumen de métricas del modelo (fps_mean, fps_std, fps_p5,
             fps_p95, inference_ms_mean/std, vehicles_per_frame_mean/std,
             avg_confidence_mean, cpu_percent_mean, ram_mb_mean, ram_mb_peak,
-            entre otros), más los campos de ROI al final: roi_enabled,
-            roi_area_ratio (None si no hay ROI), vehicles_per_frame_roi_mean
-            y false_positive_ratio (fracción de detecciones fuera del
-            polígono; None si no hay ROI activa).
+            entre otros), los campos de ROI (roi_enabled, roi_area_ratio,
+            vehicles_per_frame_roi_mean, false_positive_ratio), y al final:
+            inference_ms_median/p95/trimmed_mean, fps_median, outlier_frames
+            (estadísticas robustas a atípicos, Defecto 4), gpu_mem_peak_mb
+            (None si no hay CUDA, Defecto 3) y vehicles_per_frame_raw_mean
+            (conteo sin filtrar por ROI, para conservar la comparación;
+            Defecto 5).
+
+            Con ROI activa, `vehicles_per_frame_mean`/`_std` reflejan el
+            carril de interés (se calculan sobre `vehicle_count_roi`); sin
+            ROI, reflejan la escena completa (`vehicle_count`). En ambos
+            casos `vehicles_per_frame_raw_mean` guarda siempre el valor sin
+            filtrar, para poder comparar.
         """
         df = pd.DataFrame(frame_data)
+
+        roi_enabled = self.roi_filter is not None
+        count_col = "vehicle_count_roi" if roi_enabled else "vehicle_count"
 
         summary = {
             "model_id": model_info["model_id"],
@@ -226,15 +307,14 @@ class YOLOBenchmark:
             "fps_p95": float(np.percentile(df["fps"], 95)),
             "inference_ms_mean": float(df["inference_ms"].mean()),
             "inference_ms_std": float(df["inference_ms"].std(ddof=0)),
-            "vehicles_per_frame_mean": float(df["vehicle_count"].mean()),
-            "vehicles_per_frame_std": float(df["vehicle_count"].std(ddof=0)),
+            "vehicles_per_frame_mean": float(df[count_col].mean()),
+            "vehicles_per_frame_std": float(df[count_col].std(ddof=0)),
             "avg_confidence_mean": float(df["avg_confidence"].mean()),
             "cpu_percent_mean": float(df["cpu_percent"].mean()),
             "ram_mb_mean": float(df["ram_mb"].mean()),
             "ram_mb_peak": float(df["ram_mb"].max()),
         }
 
-        roi_enabled = self.roi_filter is not None
         total_all = df["vehicle_count"].sum()
         total_inside = df["vehicle_count_roi"].sum()
 
@@ -244,6 +324,24 @@ class YOLOBenchmark:
         summary["false_positive_ratio"] = (
             float((total_all - total_inside) / total_all) if roi_enabled and total_all > 0 else None
         )
+
+        # Defecto 4: estadísticas robustas a atípicos, adicionales a mean/std.
+        inference_ms = df["inference_ms"].to_numpy(dtype=np.float64)
+        inference_ms_median = float(np.median(inference_ms))
+        summary["inference_ms_median"] = inference_ms_median
+        summary["inference_ms_p95"] = float(np.percentile(inference_ms, 95))
+        summary["inference_ms_trimmed_mean"] = _trimmed_mean(inference_ms)
+        summary["fps_median"] = float(df["fps"].median())
+        summary["outlier_frames"] = int(np.sum(inference_ms > 10 * inference_ms_median))
+
+        # Defecto 3: memoria pico de GPU (None si la corrida fue en CPU).
+        if "gpu_mem_peak_mb" in df.columns and df["gpu_mem_peak_mb"].notna().any():
+            summary["gpu_mem_peak_mb"] = float(df["gpu_mem_peak_mb"].max())
+        else:
+            summary["gpu_mem_peak_mb"] = None
+
+        # Defecto 5: conteo crudo, para comparar contra el filtrado por ROI arriba.
+        summary["vehicles_per_frame_raw_mean"] = float(df["vehicle_count"].mean())
 
         return summary
 
@@ -378,6 +476,7 @@ class YOLOBenchmark:
             "avg_confidence", "cpu_percent", "ram_mb",
             "vehicle_count_roi", "car_count_roi", "truck_count_roi",
             "bus_count_roi", "motorcycle_count_roi",
+            "gpu_mem_allocated_mb", "gpu_mem_peak_mb",
         ]
         pd.DataFrame(all_frame_data, columns=columns).to_csv(csv_path, index=False)
 
@@ -448,27 +547,54 @@ class YOLOBenchmark:
         ax.set_xlabel("Modelo")
         ax.set_ylabel("Inferencia (ms)")
 
-        # Subplot 3: RAM usada (MB)
+        # Subplot 3: memoria — pico de GPU si la corrida fue en CUDA y hay datos; si no,
+        # RSS del proceso. La línea de 512 MB (límite típico RPi4) se saca en los dos
+        # casos: en CUDA compara magnitudes que no existen en la RPi (no tiene ese
+        # runtime cargado), y en CPU el RSS incluye intérprete y bibliotecas, no solo el
+        # modelo, así que tampoco es comparable directamente contra ese límite.
         ax = axes[1, 0]
-        ax.bar(df["model_id"], df["ram_mb_mean"], color="seagreen")
-        ax.axhline(512, color="darkred", linestyle="--", label="Límite típico RPi4 (512 MB)")
-        ax.set_title("RAM usada por modelo")
+        has_gpu_mem = "gpu_mem_peak_mb" in df.columns and df["gpu_mem_peak_mb"].notna().any()
+        if device == "cuda" and has_gpu_mem:
+            ax.bar(df["model_id"], df["gpu_mem_peak_mb"], color="seagreen")
+            ax.set_title("Memoria pico de GPU por modelo")
+            ax.set_ylabel("Memoria GPU (MB)")
+        else:
+            ax.bar(df["model_id"], df["ram_mb_mean"], color="seagreen")
+            ax.set_title("RSS del proceso por modelo (incluye intérprete y bibliotecas)")
+            ax.set_ylabel("RAM (MB)")
         ax.set_xlabel("Modelo")
-        ax.set_ylabel("RAM (MB)")
-        ax.legend()
 
-        # Subplot 4: Vehículos detectados por frame
+        # Subplot 4: vehículos por frame — si hay ROI activa, crudo vs. filtrado por el
+        # polígono, para que el contraste muestre cuánto ruido mete el parqueo de fondo.
         ax = axes[1, 1]
-        ax.bar(df["model_id"], df["vehicles_per_frame_mean"], yerr=df["vehicles_per_frame_std"],
-               capsize=4, color="darkorange")
-        ax.set_title("Vehículos detectados por frame")
+        roi_active = bool(df["roi_enabled"].iloc[0]) if "roi_enabled" in df.columns and not df.empty else False
+        if roi_active and "vehicles_per_frame_raw_mean" in df.columns:
+            x = np.arange(len(df))
+            bar_w = 0.35
+            ax.bar(x - bar_w / 2, df["vehicles_per_frame_raw_mean"], bar_w,
+                   label="Escena completa", color="darkorange")
+            ax.bar(x + bar_w / 2, df["vehicles_per_frame_mean"], bar_w,
+                   label="Zona de interés (ROI)", color="steelblue")
+            ax.set_xticks(x)
+            ax.set_xticklabels(df["model_id"])
+            ax.set_title("Vehículos por frame (escena completa vs. zona de interés)")
+            ax.legend()
+        else:
+            ax.bar(df["model_id"], df["vehicles_per_frame_mean"], yerr=df["vehicles_per_frame_std"],
+                   capsize=4, color="darkorange")
+            ax.set_title("Vehículos detectados por frame")
         ax.set_xlabel("Modelo")
         ax.set_ylabel("Vehículos / frame")
 
         for ax in axes.flat:
             ax.tick_params(axis="x", rotation=20)
 
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        fig.text(
+            0.5, 0.01,
+            "El consumo de memoria del equipo de desarrollo no es extrapolable a la plataforma embebida.",
+            ha="center", fontsize=8, style="italic",
+        )
+        fig.tight_layout(rect=[0, 0.03, 1, 0.96])
         benchmark_plot_path = os.path.join(self.plots_dir, f"benchmark_{timestamp}.png")
         fig.savefig(benchmark_plot_path, dpi=150)
         plt.close(fig)
